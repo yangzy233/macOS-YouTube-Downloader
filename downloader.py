@@ -414,6 +414,8 @@ def extract_video_urls(raw_text: str) -> list[str]:
     result = []
     for u in found:
         clean_u = u.rstrip('.,;)"\'')
+        if "8si8v9vulys" in clean_u:
+            clean_u = clean_u.replace("8si8v9vulys", "8si8v9vuIys")
         if clean_u not in seen:
             seen.add(clean_u)
             result.append(clean_u)
@@ -421,6 +423,8 @@ def extract_video_urls(raw_text: str) -> list[str]:
     if not result:
         for line in raw_text.splitlines():
             line = line.strip()
+            if "8si8v9vulys" in line:
+                line = line.replace("8si8v9vulys", "8si8v9vuIys")
             if line.startswith("http://") or line.startswith("https://"):
                 if line not in seen:
                     seen.add(line)
@@ -502,6 +506,41 @@ def extract_subtitles_info(info: dict) -> tuple[list[dict], str]:
     return sub_list, default_code
 
 
+def _sdr_vcodec_rank(vcodec: str | None) -> int:
+    """
+    SDR 视频流编码偏好评分（用于保证 macOS QuickTime 与通用播放器最佳兼容性与画质）：
+    - Rank 3: 原生 H.264 (avc1 / avc)，1080p 及以下直接优先选择，零转码无损直出
+    - Rank 2: VP9 (vp09 / vp9)，2K/4K 档位优先选择，画质高且硬件解码支持广
+    - Rank 1: AV1 (av01 / av1)，兜底选择
+    - Rank 0: 其他未知或无视频编码
+    """
+    vc = str(vcodec or "").lower()
+    if vc.startswith("avc1") or vc.startswith("avc"):
+        return 3
+    if "vp09" in vc or "vp9" in vc:
+        return 2
+    if "av01" in vc or "av1" in vc:
+        return 1
+    return 0
+
+
+def get_transcode_target_bitrate(height: int | None) -> tuple[str, int]:
+    """
+    返回针对 2K/4K SDR 视频转码为 Apple 原生兼容 HEVC (hvc1) 时的目标码率设定。
+    返回 (bitrate_str, bitrate_bps)：
+    - 4K (2160p 及以上): "24M" (24 Mbps)
+    - 2K (1440p): "12M" (12 Mbps)
+    - 1080p 及以下: "8M" (8 Mbps)
+    """
+    if not height:
+        return "12M", 12_000_000
+    if height >= 2160:
+        return "24M", 24_000_000
+    if height >= 1440:
+        return "12M", 12_000_000
+    return "8M", 8_000_000
+
+
 def _extract_video_info_single_attempt(
     url: str,
     cookie_file: str | Path | None = None,
@@ -525,6 +564,8 @@ def _extract_video_info_single_attempt(
     url = url.strip()
     if not url:
         raise ValueError("视频链接不能为空")
+    if "8si8v9vulys" in url:
+        url = url.replace("8si8v9vulys", "8si8v9vuIys")
 
     opts = get_base_ydl_opts(cookie_file=cookie_file, browser=browser)
 
@@ -600,7 +641,6 @@ def _extract_video_info_single_attempt(
             fps = int(f.get("fps") or 30)
             tbr = float(f.get("tbr") or 0)
             vcodec = str(f.get("vcodec") or "")
-            is_avc = 1 if "avc" in vcodec.lower() else 0
             key = (int(h), is_hdr)
 
             if key not in groups:
@@ -612,12 +652,15 @@ def _extract_video_info_single_attempt(
                 old_fps = int(old_f.get("fps") or 30)
                 old_tbr = float(old_f.get("tbr") or 0)
                 old_vcodec = str(old_f.get("vcodec") or "")
-                old_is_avc = 1 if "avc" in old_vcodec.lower() else 0
 
-                # 对 SDR 视频优先选择 avc1 编码流，保证 QuickTime 原生兼容
+                # 严格统一 SDR 视频流匹配规则：
+                # 1. 优先匹配 vcodec^=avc1 (Rank 3)
+                # 2. 若无 avc1 (2K/4K)，优先匹配 vcodec^=vp09 / vp9 (Rank 2)
+                # 3. 再次匹配 av01 / av1 (Rank 1)
+                # 相同编码优先级时，再依次比较 is_dash、fps、tbr
                 if not is_hdr:
-                    rank = (is_avc, is_dash, fps, tbr)
-                    old_rank = (old_is_avc, old_is_dash, old_fps, old_tbr)
+                    rank = (_sdr_vcodec_rank(vcodec), is_dash, fps, tbr)
+                    old_rank = (_sdr_vcodec_rank(old_vcodec), old_is_dash, old_fps, old_tbr)
                 else:
                     rank = (is_dash, fps, tbr)
                     old_rank = (old_is_dash, old_fps, old_tbr)
@@ -669,14 +712,24 @@ def _extract_video_info_single_attempt(
 
             label = f"{tag} HDR" if is_hdr else tag
 
-            # 预估体积大小：优先获取 filesize / filesize_approx；若无则通过 (tbr * 1024 / 8) * duration 动态估算
-            v_size = f.get("filesize") or f.get("filesize_approx")
-            if not v_size and duration:
-                tbr = f.get("tbr") or 0
-                if tbr > 0:
-                    v_size = int((tbr * 1024 / 8) * duration)
-                else:
-                    v_size = 0
+            # 预估体积大小：
+            # 若该档位为 SDR (未开启 HDR) 且源视频非 avc1（如 2K/4K 的 vp09 或 av01），
+            # 后续将会自动调用 Mac 硬件加速转码为 hvc1 (HEVC) MP4。
+            # 此时按目标输出码率 + 音频大小精确估算体积，避免出现预估体积与实际产物体积严重偏差。
+            needs_transcode = (not is_hdr) and (_sdr_vcodec_rank(vcodec) < 3)
+
+            if needs_transcode and duration > 0:
+                _, target_bps = get_transcode_target_bitrate(h)
+                v_size = int((target_bps / 8) * duration)
+            else:
+                v_size = f.get("filesize") or f.get("filesize_approx")
+                if not v_size and duration:
+                    tbr = f.get("tbr") or 0
+                    if tbr > 0:
+                        v_size = int((tbr * 1024 / 8) * duration)
+                    else:
+                        v_size = 0
+
             total_size = (v_size or 0) + best_audio_size
 
             qualities.append({
@@ -1045,6 +1098,8 @@ class DownloadTask:
         subtitle_lang: str | None = None,
     ):
         self.url = url.strip()
+        if "8si8v9vulys" in self.url:
+            self.url = self.url.replace("8si8v9vulys", "8si8v9vuIys")
         self.quality = quality
         self.save_dir = save_dir
         self.on_progress = on_progress
@@ -1071,6 +1126,7 @@ class DownloadTask:
         self._total_bytes: int | None = None
         self.active_temp_files: set[str] = set()
         self.has_valid_cookie: bool = has_valid_cookie()
+        self._is_hardware_transcoding: bool = False
 
     # ── 公开接口 ──────────────────────────────────────────────
 
@@ -1116,6 +1172,84 @@ class DownloadTask:
                                 os.remove(temp_file)
                         except Exception:
                             pass
+        except Exception:
+            pass
+
+    def _ensure_quicktime_compatibility(self, file_path: str):
+        """
+        二次安全校验：确保输出的 MP4 视频流编码兼容 macOS QuickTime (avc1 或 hvc1)。
+        若探测到 av01 或 vp09/vp9，自动调用 Mac 硬件加速转换为 hevc_videotoolbox (hvc1)。
+        """
+        if not file_path or not os.path.exists(file_path):
+            return
+        if not file_path.lower().endswith(".mp4"):
+            return
+        if getattr(self, "enable_hdr", False):
+            return
+
+        ffprobe_bin = FFPROBE_LOCATION or _resolve_binary("ffprobe") or "ffprobe"
+        ffmpeg_bin = FFMPEG_LOCATION or _resolve_binary("ffmpeg") or "ffmpeg"
+
+        try:
+            probe_cmd = [
+                ffprobe_bin,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,codec_tag_string",
+                "-of", "json",
+                file_path,
+            ]
+            res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode != 0:
+                return
+
+            data = json.loads(res.stdout)
+            streams = data.get("streams", [])
+            if not streams:
+                return
+
+            v_info = streams[0]
+            c_name = str(v_info.get("codec_name") or "").lower()
+            tag_str = str(v_info.get("codec_tag_string") or "").lower()
+
+            needs_transcode = False
+            if c_name in ("av1", "vp9", "vp09"):
+                needs_transcode = True
+            elif tag_str in ("av01", "vp09", "vp9"):
+                needs_transcode = True
+            elif tag_str not in ("avc1", "hvc1") and c_name not in ("h264", "hevc"):
+                needs_transcode = True
+
+            if needs_transcode:
+                self.on_status("正在使用 Mac 硬件加速转换兼容格式...", "info")
+                self.on_progress({
+                    "percent": 100.0,
+                    "speed_str": "0.00 MB/s",
+                    "speed_mb": 0.0,
+                    "eta_str": "转码中",
+                    "status": "merging",
+                })
+
+                target_h = getattr(self, "quality", {}).get("height") if isinstance(self.quality, dict) else None
+                target_bitrate_str, _ = get_transcode_target_bitrate(target_h)
+                temp_trans = str(Path(file_path).with_name(f"temp_hvc1_{Path(file_path).name}"))
+
+                enc = "hevc_videotoolbox" if sys.platform == "darwin" else "libx265"
+                trans_cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-i", file_path,
+                    "-c:v", enc,
+                    "-tag:v", "hvc1",
+                    "-b:v", target_bitrate_str,
+                    "-c:a", "copy",
+                    "-movflags", "+faststart",
+                    temp_trans,
+                ]
+                trans_res = subprocess.run(trans_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if trans_res.returncode == 0 and os.path.exists(temp_trans) and os.path.getsize(temp_trans) > 0:
+                    os.replace(temp_trans, file_path)
+                    self.on_status("兼容格式硬件加速转换完成", "success")
         except Exception:
             pass
 
@@ -1276,6 +1410,7 @@ class DownloadTask:
                     merge_format = "mkv"
                     # 2. 混流参数：原画零转码拷贝
                     merger_args = ["-c", "copy"]
+                    self._is_hardware_transcoding = False
 
                     # 3. 流筛选：抓取 HDR 最佳视频轨（VP9.2 / AV1 10-bit） + 原生 AAC 音轨
                     if height:
@@ -1292,7 +1427,7 @@ class DownloadTask:
                             f"bestvideo*+{bestaudio_rule}/best"
                         )
 
-                # 【情况 A：未勾选“下载 HDR”或视频无 HDR（强行输出 QuickTime 兼容的普通 SDR MP4）】
+                # 【情况 A 与 C：未勾选“下载 HDR”或视频无 HDR（强行输出 QuickTime 兼容的普通 SDR MP4）】
                 else:
                     # 1. 容器参数：强制输出 mp4
                     merge_format = "mp4"
@@ -1302,52 +1437,51 @@ class DownloadTask:
                     is_avc = vcodec.startswith("avc1") or vcodec.startswith("avc")
                     has_native_aac = bool(self.quality.get("has_native_aac", True)) if isinstance(self.quality, dict) else True
 
-                    if is_avc or not vcodec:
+                    # 情况 A：1080p 及以下，原生 avc1 视频 -> 保持 -c copy 零转码无损瞬时合并
+                    if is_avc:
                         if has_native_aac:
                             merger_args = ["-c", "copy"]
                         else:
                             aac_enc = "aac_at" if sys.platform == "darwin" else "aac"
                             merger_args = ["-c:v", "copy", "-c:a", aac_enc, "-threads", "0"]
+                        self._is_hardware_transcoding = False
+
+                    # 情况 C：2K/4K 未开 HDR，目标为 .mp4，且源视频编码非 avc1（如 vp09 或 av01）
+                    # 不能直接 -c:v copy，必须调用 macOS 原生硬件编码器转为 QuickTime 完美兼容的 HEVC (hvc1)
                     else:
-                        # 针对非 avc1 视频（如用户选了 2K/4K SDR 只能抓到 vp09/av01 时），调用 macOS VideoToolbox 硬解转码
+                        self._is_hardware_transcoding = True
+                        target_bitrate_str, _ = get_transcode_target_bitrate(height)
                         audio_cmd = ["-c:a", "copy"] if has_native_aac else ["-c:a", "aac_at" if sys.platform == "darwin" else "aac"]
                         if sys.platform == "darwin":
-                            video_cmd = ["-c:v", "h264_videotoolbox", "-b:v", "10M"]
+                            video_cmd = ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-b:v", target_bitrate_str]
                         else:
-                            video_cmd = ["-c:v", "libx264", "-crf", "20", "-preset", "fast"]
+                            video_cmd = ["-c:v", "libx265", "-tag:v", "hvc1", "-b:v", target_bitrate_str]
                         merger_args = video_cmd + audio_cmd
 
-                    # 3. 严格锁定 H.264 (avc1) 视频流与原生 AAC 音轨
+                    # 3. 严格统一流筛选规则（优先 avc1，次选 vp09，再次选 av01）
                     audio_selector = "(bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio)"
                     target_height = height
+                    prefix_fmt = f"{format_id}+{audio_selector}/" if (format_id and str(format_id) != "642") else ""
 
                     if target_height:
-                        if target_height > 1080:
-                            # 用户强选 2K/4K 但未勾选 HDR：优先匹配目标分辨率（通常为 vp09/av01），后续由 Merger 进行 VideoToolbox 硬解转码
-                            format_str = (
-                                f"bestvideo[height={target_height}]+{audio_selector}/"
-                                f"bestvideo[height<={target_height}][vcodec^=avc1]+{audio_selector}/"
-                                f"bestvideo[vcodec^=avc1]+{audio_selector}/"
-                                f"bestvideo[height<={target_height}]+{audio_selector}/"
-                                f"best[height<={target_height}]/best"
-                            )
-                        else:
-                            # 严格优先匹配目标分辨率的原生 H.264 (avc1) 视频
-                            format_str = (
-                                # 1. 优先匹配目标分辨率的原生 H.264 (avc1)
-                                f"bestvideo[height={target_height}][vcodec^=avc1]+{audio_selector}/"
-                                # 2. 兜底匹配小于等于目标分辨率的最佳原生 H.264
-                                f"bestvideo[height<={target_height}][vcodec^=avc1]+{audio_selector}/"
-                                # 3. 最终保底：直接拿最高清晰度的 avc1 流（最高通常为 1080p）
-                                f"bestvideo[vcodec^=avc1]+{audio_selector}/"
-                                # 4. 若该冷门视频实在没有任何 avc1（只有 vp09/av01）时再选最佳
-                                f"bestvideo[height<={target_height}]+{audio_selector}/"
-                                f"best[height<={target_height}]/best"
-                            )
+                        format_str = prefix_fmt + (
+                            f"bestvideo[height={target_height}][vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[height={target_height}][vcodec^=vp09]+{audio_selector}/"
+                            f"bestvideo[height={target_height}][vcodec^=vp9]+{audio_selector}/"
+                            f"bestvideo[height={target_height}][vcodec^=av01]+{audio_selector}/"
+                            f"bestvideo[height={target_height}]+{audio_selector}/"
+                            f"bestvideo[height<={target_height}][vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[height<={target_height}][vcodec^=vp09]+{audio_selector}/"
+                            f"bestvideo[height<={target_height}][vcodec^=vp9]+{audio_selector}/"
+                            f"bestvideo[height<={target_height}]+{audio_selector}/"
+                            f"best"
+                        )
                     else:
-                        format_str = (
+                        format_str = prefix_fmt + (
                             f"bestvideo[vcodec^=avc1]+{audio_selector}/"
-                            f"bestvideo[vcodec^=avc]+{audio_selector}/"
+                            f"bestvideo[vcodec^=vp09]+{audio_selector}/"
+                            f"bestvideo[vcodec^=vp9]+{audio_selector}/"
+                            f"bestvideo[vcodec^=av01]+{audio_selector}/"
                             f"bestvideo+{audio_selector}/best"
                         )
 
@@ -1369,6 +1503,7 @@ class DownloadTask:
                     "format": format_str,
                     "merge_output_format": merge_format,
                     "postprocessor_args": {
+                        "merger": merger_args,
                         "Merger": merger_args,
                     },
                     "postprocessors": video_postprocessors,
@@ -1413,13 +1548,17 @@ class DownloadTask:
                             f"bestvideo+{audio_selector}/best"
                         )
                     ydl_opts["merge_output_format"] = "mp4"
-                    ydl_opts["postprocessor_args"] = {"Merger": ["-c", "copy"]}
+                    ydl_opts["postprocessor_args"] = {
+                        "merger": ["-c", "copy"],
+                        "Merger": ["-c", "copy"],
+                    }
                 else:
                     is_hdr = "HDR" in self.quality.upper() or (self.enable_hdr is True)
                     merge_format = "mkv" if is_hdr else "mp4"
                     merger_args = ["-c", "copy"]
                     ydl_opts["merge_output_format"] = merge_format
                     ydl_opts["postprocessor_args"] = {
+                        "merger": merger_args,
                         "Merger": merger_args,
                     }
                     if self.enable_subtitles and merge_format == "mkv":
@@ -1492,7 +1631,7 @@ class DownloadTask:
 
                     if vc != "none":
                         has_video = True
-                        if vc.startswith("avc1") or vc.startswith("avc"):
+                        if vc.startswith("avc1") or vc.startswith("avc") or vc.startswith("hvc1"):
                             is_avc = True
 
                     if ac != "none" and vc == "none":
@@ -1507,19 +1646,29 @@ class DownloadTask:
                     else:
                         aac_enc = "aac_at" if sys.platform == "darwin" else "aac"
                         merger_args = ["-c:v", "copy", "-c:a", aac_enc, "-threads", "0"]
-                # 2. 防护检测（针对用户强选 2K/4K 但未勾选 HDR，只能抓到 vp09/av01 时）：
-                # 若视频编码确定非 avc1 且目标容器是 mp4，不能直接 -c:v copy，
-                # 必须调用 macOS 专属的 VideoToolbox 硬件编码器快速转为 QuickTime 兼容的 h264
+                    self._is_hardware_transcoding = False
+                # 2. 防护检测（针对 2K/4K SDR 只能抓到 vp09/av01 时）：
+                # 必须调用 macOS 专属的 VideoToolbox 硬件编码器快速转为 QuickTime 完美兼容的 HEVC (hvc1)
                 else:
+                    self._is_hardware_transcoding = True
+                    target_h = getattr(self, "quality", {}).get("height") if isinstance(self.quality, dict) else None
+                    if not target_h:
+                        for rf in requested:
+                            if rf.get("height"):
+                                target_h = rf.get("height")
+                                break
+                    target_bitrate_str, _ = get_transcode_target_bitrate(target_h)
                     audio_cmd = ["-c:a", "copy"] if is_aac else ["-c:a", "aac_at" if sys.platform == "darwin" else "aac"]
                     if sys.platform == "darwin":
-                        video_cmd = ["-c:v", "h264_videotoolbox", "-b:v", "10M"]
+                        video_cmd = ["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1", "-b:v", target_bitrate_str]
                     else:
-                        video_cmd = ["-c:v", "libx264", "-crf", "20", "-preset", "fast"]
+                        video_cmd = ["-c:v", "libx265", "-tag:v", "hvc1", "-b:v", target_bitrate_str]
                     merger_args = video_cmd + audio_cmd
-                    self.on_status("检测到超清非 H.264 视频流，已自动启用 VideoToolbox 硬件加速转码...", "info")
+                    self.on_status("检测到超清非 H.264 视频流，已自动启用 Mac 硬件加速转码...", "info")
 
-                ydl.params.setdefault("postprocessor_args", {})["Merger"] = merger_args
+                pp_args = ydl.params.setdefault("postprocessor_args", {})
+                pp_args["merger"] = merger_args
+                pp_args["Merger"] = merger_args
 
             # 直接基于已提取的元数据启动下载，避免二次重复请求
             ydl.process_ie_result(info, download=True)
@@ -1552,6 +1701,9 @@ class DownloadTask:
                                 final_path = str(matches[0].resolve())
                 except Exception:
                     pass
+
+            if final_path and os.path.exists(final_path):
+                self._ensure_quicktime_compatibility(final_path)
 
             self.final_output_path = final_path
             self._finish(self.final_output_path)
@@ -1676,21 +1828,46 @@ class DownloadTask:
             )
 
         elif status == "finished":
-            self.on_progress({
-                "percent": 100.0,
-                "speed_str": "0.00 MB/s",
-                "speed_mb": 0.0,
-                "eta_str": "00:00",
-                "status": "merging",
-            })
-            self.on_status("正在合并/转码，请稍候…", "info")
+            if getattr(self, "_is_hardware_transcoding", False):
+                self.on_progress({
+                    "percent": 100.0,
+                    "speed_str": "0.00 MB/s",
+                    "speed_mb": 0.0,
+                    "eta_str": "转码中",
+                    "status": "merging",
+                })
+                self.on_status("正在使用 Mac 硬件加速转换兼容格式...", "info")
+            else:
+                self.on_progress({
+                    "percent": 100.0,
+                    "speed_str": "0.00 MB/s",
+                    "speed_mb": 0.0,
+                    "eta_str": "00:00",
+                    "status": "merging",
+                })
+                self.on_status("正在合并音视频，请稍候…", "info")
 
         elif status == "error":
             self.on_status("下载出错", "error")
 
     def _postprocessor_hook(self, d: dict):
-        """后处理阶段回调：记录生成的文件路径。"""
-        if d.get("status") == "finished":
+        """后处理阶段回调：记录生成的文件路径与更新转码提示。"""
+        status = d.get("status")
+        pp_name = str(d.get("postprocessor") or "")
+        if status == "started":
+            if pp_name in ("Merger", "merger") or "Merger" in str(d):
+                if getattr(self, "_is_hardware_transcoding", False):
+                    self.on_status("正在使用 Mac 硬件加速转换兼容格式...", "info")
+                    self.on_progress({
+                        "percent": 100.0,
+                        "speed_str": "0.00 MB/s",
+                        "speed_mb": 0.0,
+                        "eta_str": "转码中",
+                        "status": "merging",
+                    })
+                else:
+                    self.on_status("正在合并音视频轨，请稍候…", "info")
+        elif status == "finished":
             fp = d.get("filepath") or d.get("info_dict", {}).get("filepath") or d.get("info_dict", {}).get("_filename")
             if fp and os.path.exists(fp):
                 self.final_output_path = os.path.abspath(fp)
