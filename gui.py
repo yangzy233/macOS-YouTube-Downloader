@@ -16,7 +16,7 @@ import webbrowser
 
 import customtkinter as ctk
 
-from config import load_settings, save_settings, update_setting
+from config import INTERNAL_COOKIE_PATH, load_settings, save_settings, update_setting
 from downloader import (
     DownloadTask,
     clear_current_cookie,
@@ -30,6 +30,7 @@ from downloader import (
     save_imported_cookie,
     set_browser_cookie,
     set_current_cookie_file,
+    validate_cookie_file,
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -1115,7 +1116,7 @@ class App(ctk.CTk):
             if has_valid_cookie():
                 c_path = get_current_cookie_file()
                 b_name = get_browser_cookie()
-                source_str = f"文件路径：{c_path}" if c_path else f"本地浏览器：{b_name}"
+                source_str = f"应用专属托管：{c_path}" if c_path else f"本地浏览器：{b_name}"
                 status_tag.configure(text="● 当前状态: Cookie 已生效", text_color=("#1A8838", "#30D158"))
                 status_path_lbl.configure(text=source_str, text_color=COLOR_TEXT_SECONDARY)
                 btn_remove.pack(side="left", padx=(0, 10))
@@ -1128,14 +1129,30 @@ class App(ctk.CTk):
             chosen = self._choose_cookie_file()
             if not chosen:
                 return
+
+            # 1. 基础内容与格式校验
+            valid, reason = validate_cookie_file(chosen)
+            if not valid:
+                messagebox.showerror(
+                    "无效的 Cookie 文件",
+                    f"所选文件未通过格式校验：\n{reason}\n\n请确认是由「Get cookies.txt LOCALLY」扩展导出的 Netscape 格式 cookies.txt 文本文件。",
+                    parent=dialog,
+                )
+                return
+
+            # 2. 执行物理拷贝导入至应用独立专属配置目录
             try:
                 saved_path = save_imported_cookie(chosen)
                 self._refresh_cookie_status()
-                self._set_status(f"Cookie 已导入生效: {saved_path.name}", "success")
+                self._set_status("Cookie 凭据已安全导入至应用配置目录", "success")
                 _refresh_dialog_status()
+                status_path_lbl.configure(
+                    text="✅ 已安全导入至应用独立配置目录（可放心删除原文件）",
+                    text_color=("#1A8838", "#30D158"),
+                )
                 messagebox.showinfo(
                     "导入成功",
-                    "Cookie 导入成功！已解锁 4K/HDR 原画与防风控验证",
+                    f"Cookie 凭据已成功导入至应用专属配置目录：\n\n{saved_path}\n\n✅ 软件已建立独立持久化副本，您现在可以放心将下载或桌面中的原 cookies.txt 文件删除！",
                     parent=dialog,
                 )
             except Exception as err:
@@ -1144,7 +1161,7 @@ class App(ctk.CTk):
         def _on_remove_clicked():
             ans = messagebox.askyesno(
                 "移除 Cookie",
-                "确定要移除当前导入的 YouTube Cookie 凭据吗？\n\n移除后下载受限或会员视频可能需要重新配置。",
+                "确定要从应用配置目录中移除当前 YouTube Cookie 凭据吗？\n\n移除后下载受限或会员视频可能需要重新配置。",
                 parent=dialog,
             )
             if ans:
@@ -1152,7 +1169,7 @@ class App(ctk.CTk):
                 self._refresh_cookie_status()
                 self._set_status("已移除 Cookie 登录凭据", "info")
                 _refresh_dialog_status()
-                messagebox.showinfo("已移除", "Cookie 凭据已移除，已恢复为未登录状态。", parent=dialog)
+                messagebox.showinfo("已移除", "Cookie 凭据已完全移除，已恢复为未登录状态。", parent=dialog)
 
         btn_import = ctk.CTkButton(
             action_bar,

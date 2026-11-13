@@ -14,6 +14,18 @@ DEFAULT_SETTINGS = {
     "prefer_hdr": False,          # 默认普通 SDR (MP4)
 }
 
+# 应用内部独立托管的专属 Cookie 持久化存储路径
+INTERNAL_COOKIE_PATH = os.path.expanduser("~/.config/youtubedownloader/cookies.txt")
+
+def get_internal_cookie_path() -> Path:
+    """获取并确保应用专属配置目录存在的内部 Cookie 路径。"""
+    p = Path(INTERNAL_COOKIE_PATH)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
 def _get_settings_path() -> Path:
     config_dir = Path.home() / ".config" / "youtubedownloader"
     try:

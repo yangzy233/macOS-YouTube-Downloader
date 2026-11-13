@@ -114,32 +114,90 @@ ARIA2C_LOCATION: str | None = _resolve_aria2c()
 
 
 # ──────────────────────────────────────────────────────────────
-# Cookie 自动探测与管理体系
+# Cookie 自动探测与独立托管体系
 # ──────────────────────────────────────────────────────────────
+try:
+    from config import INTERNAL_COOKIE_PATH
+except Exception:
+    INTERNAL_COOKIE_PATH = os.path.expanduser("~/.config/youtubedownloader/cookies.txt")
+
 _CURRENT_COOKIE_FILE: Path | None = None
 _CURRENT_BROWSER: str | None = None
+_COOKIE_DISABLED: bool = False
+
+
+def validate_cookie_file(path: Path | str | None) -> tuple[bool, str]:
+    """
+    深度校验 Cookie 文件的有效性与内容规范。
+    返回 (is_valid: bool, reason: str)。
+    """
+    if not path:
+        return False, "未指定文件路径"
+    p = Path(path)
+    if not p.is_file():
+        return False, "指定的文件不存在或不是常规文件"
+    try:
+        size = p.stat().st_size
+        if size == 0:
+            return False, "文件内容为空 (0 字节)"
+        if size > 10 * 1024 * 1024:
+            return False, "文件体积过大，疑似非 Cookie 文本文件"
+
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [f.readline() for _ in range(40)]
+
+        content = "".join(lines)
+        if not content.strip():
+            return False, "文件无任何有效文本内容"
+
+        # 特征1: Netscape HTTP Cookie File 标准声明文件头
+        if "Netscape HTTP Cookie File" in content or "# HTTP Cookie File" in content:
+            return True, "有效 Netscape Cookie 规范文件"
+
+        # 特征2: 检查是否存在由制表符 (\t) 分隔的合法域名记录行
+        # Netscape 格式规范通常包含 7 列: domain, flag, path, secure, expiration, name, value
+        valid_rows = 0
+        for line in lines:
+            line_str = line.strip()
+            if not line_str or line_str.startswith("#"):
+                continue
+            parts = line_str.split("\t")
+            if len(parts) >= 6:
+                domain = parts[0].lower()
+                if "." in domain or domain.startswith("#http"):
+                    valid_rows += 1
+
+        if valid_rows >= 1:
+            return True, "包含有效 Tab 分隔 Cookie 记录"
+
+        # 特征3: 包含 YouTube 核心登录凭据关键字段
+        yt_markers = ["youtube.com", "LOGIN_INFO", "VISITOR_INFO1_LIVE", "SAPISID", "HSID", "SSID", "APISID", "SID"]
+        if any(marker in content for marker in yt_markers):
+            return True, "包含 YouTube 登录凭据有效字段"
+
+        return False, "所选文件不符合 Netscape HTTP Cookie 格式规范（未包含标准文件头或 Tab 分隔记录）"
+    except Exception as e:
+        return False, f"读取文件异常: {e}"
 
 
 def is_valid_cookie_file(path: Path | str | None) -> bool:
-    """验证文件是否存在、非空且可正常读取。"""
-    if not path:
-        return False
-    p = Path(path)
-    try:
-        if not p.is_file() or p.stat().st_size == 0:
-            return False
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            chunk = f.read(1024)
-            return len(chunk.strip()) > 0
-    except Exception:
-        return False
+    """验证文件是否存在、非空且符合 Cookie 格式特征。"""
+    valid, _ = validate_cookie_file(path)
+    return valid
 
 
 def get_cookie_search_paths() -> list[Path]:
-    """返回所有待探测的 cookies.txt 候选路径列表（按优先级排列）。"""
-    home = Path.home()
+    """
+    返回所有待探测的 cookies.txt 候选路径列表（按优先级排列）。
+    注意：为避免用户主动移除 Cookie 后又自动捡回，严禁盲目自动扫描 ~/Downloads 目录。
+    """
     candidates: list[Path] = []
-    # 1. 项目根目录 / 打包资源目录 / 当前运行环境目录中的 cookies.txt 及常见扩展命名
+
+    # 1. 第一优先级：应用专属独立托管持久化路径 ~/.config/youtubedownloader/cookies.txt
+    internal_cookie = Path(INTERNAL_COOKIE_PATH).resolve()
+    candidates.append(internal_cookie)
+
+    # 2. 兜底兼容：项目根目录 / 打包资源目录中的 cookies.txt
     cookie_names = ["cookies.txt", "www.youtube.com_cookies.txt", "youtube.com_cookies.txt", "youtube_cookies.txt"]
     for d in _search_dirs:
         for name in cookie_names:
@@ -147,26 +205,16 @@ def get_cookie_search_paths() -> list[Path]:
             if cand not in candidates:
                 candidates.append(cand)
 
-    # 2. 用户标准配置目录 ~/.config/yt-dlp/cookies.txt
-    candidates.append(home / ".config" / "yt-dlp" / "cookies.txt")
-
-    # 3. 用户下载目录 ~/Downloads/ 下的标准命名与动态扫描
-    downloads = home / "Downloads"
-    for name in cookie_names:
-        cand = downloads / name
-        if cand not in candidates:
-            candidates.append(cand)
-    try:
-        if downloads.is_dir():
-            for p in sorted(downloads.glob("*cookie*.txt"), key=lambda x: x.stat().st_mtime, reverse=True):
-                if p not in candidates:
-                    candidates.append(p)
-    except Exception:
-        pass
+    # 3. 用户通用配置目录 ~/.config/yt-dlp/cookies.txt
+    home = Path.home()
+    yt_dlp_cfg = home / ".config" / "yt-dlp" / "cookies.txt"
+    if yt_dlp_cfg not in candidates:
+        candidates.append(yt_dlp_cfg)
 
     # 4. 用户主目录相关备选 ~/.yt-dlp/cookies.txt 与 ~/cookies.txt
     candidates.append(home / ".yt-dlp" / "cookies.txt")
     candidates.append(home / "cookies.txt")
+
     return candidates
 
 
@@ -180,10 +228,7 @@ def resolve_cookies_path() -> Path | None:
             continue
     return None
 
-
-_CURRENT_COOKIE_FILE: Path | None = None
-_CURRENT_BROWSER: str | None = None
-_COOKIE_DISABLED: bool = False
+get_valid_cookie_path = resolve_cookies_path
 
 
 def get_current_cookie_file() -> Path | None:
@@ -235,30 +280,39 @@ def has_valid_cookie() -> bool:
 
 def save_imported_cookie(source_path: str | Path) -> Path:
     """
-    将用户选择的 cookies.txt 安全持久化到应用环境与用户标准配置目录。
+    将用户选择的 cookies.txt 进行物理拷贝导入，保存至应用专属配置目录：
+    ~/.config/youtubedownloader/cookies.txt
+    彻底脱离对原始文件的依赖，使用户删除原下载文件后仍能正常使用。
     返回保存的目标路径。
     """
-    global _COOKIE_DISABLED
+    global _COOKIE_DISABLED, _CURRENT_COOKIE_FILE
     _COOKIE_DISABLED = False
     src = Path(source_path).resolve()
-    if not is_valid_cookie_file(src):
-        raise ValueError(f"所选文件无效或为空: {src}")
 
-    # 优先拷贝到当前工作目录/项目目录下的 cookies.txt
-    target = Path.cwd() / "cookies.txt"
+    valid, reason = validate_cookie_file(src)
+    if not valid:
+        raise ValueError(f"所选 Cookie 文件未通过格式校验：{reason}")
+
+    target = Path(INTERNAL_COOKIE_PATH).resolve()
     try:
-        shutil.copy2(src, target)
-    except Exception:
-        target = Path.home() / ".config" / "yt-dlp" / "cookies.txt"
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, target)
+    except Exception:
+        pass
 
-    # 同时向 ~/.config/yt-dlp/cookies.txt 备份一份，确保 yt-dlp 全局可复用
+    # 物理拷贝到应用专属配置目录
+    if src != target:
+        shutil.copy2(src, target)
+        try:
+            os.chmod(target, 0o600)  # 仅当前用户读写
+        except Exception:
+            pass
+
+    # 同时向 ~/.config/yt-dlp/cookies.txt 备份一份，保持通用兼容
     try:
         cfg_target = Path.home() / ".config" / "yt-dlp" / "cookies.txt"
-        if cfg_target.resolve() != target.resolve():
+        if cfg_target.resolve() != target:
             cfg_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, cfg_target)
+            shutil.copy2(target, cfg_target)
     except Exception:
         pass
 
@@ -267,22 +321,30 @@ def save_imported_cookie(source_path: str | Path) -> Path:
 
 
 def clear_current_cookie() -> bool:
-    """清理当前生效的 Cookie 文件与浏览器配置，重置为未登录状态。"""
+    """清理应用专属托管的 Cookie 文件与运行时状态，彻底恢复为未登录状态。"""
     global _CURRENT_COOKIE_FILE, _CURRENT_BROWSER, _COOKIE_DISABLED
     _COOKIE_DISABLED = True
     _CURRENT_BROWSER = None
     files_to_remove = set()
+
+    # 1. 应用内部独立托管路径
+    internal_cookie = Path(INTERNAL_COOKIE_PATH).resolve()
+    files_to_remove.add(internal_cookie)
+
+    # 2. 当前激活文件
     if _CURRENT_COOKIE_FILE:
         files_to_remove.add(Path(_CURRENT_COOKIE_FILE).resolve())
 
+    # 3. 项目工作目录与通用配置目录中的残留副本
     cwd_cookie = (Path.cwd() / "cookies.txt").resolve()
     files_to_remove.add(cwd_cookie)
     cfg_cookie = (Path.home() / ".config" / "yt-dlp" / "cookies.txt").resolve()
     files_to_remove.add(cfg_cookie)
 
     for f in files_to_remove:
-        # 保护用户 Downloads 目录下的原始文件不被直接删除，仅从当前应用状态中解绑
-        if "Downloads" not in str(f):
+        # 保护用户的 Downloads 与 Desktop 目录，绝不误删用户个人下载的原文件
+        f_str = str(f)
+        if "Downloads" not in f_str and "Desktop" not in f_str:
             try:
                 if f.exists() and f.is_file():
                     f.unlink()
