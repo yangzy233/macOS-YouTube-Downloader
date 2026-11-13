@@ -1,0 +1,1639 @@
+"""
+downloader.py — 下载引擎模块
+封装 yt-dlp 的视频元数据解析、动态可用画质提取、后台多线程下载与 FFmpeg 混流。
+"""
+from __future__ import annotations
+
+import os
+import sys
+import shutil
+import threading
+import time
+import urllib.request
+from typing import Callable, Optional
+from pathlib import Path
+import yt_dlp
+
+
+# ──────────────────────────────────────────────────────────────
+# 运行时资源与二进制路径适配（兼容开发环境与 PyInstaller 打包环境）
+# ──────────────────────────────────────────────────────────────
+def get_bundle_dir() -> str:
+    """获取应用程序运行时的资源根目录（兼容开发环境与 PyInstaller 打包环境）。"""
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+_bundle_dir = Path(get_bundle_dir())
+_project_dir = _bundle_dir
+_exec_dir = Path(os.path.dirname(sys.executable)) if getattr(sys, 'frozen', False) else _bundle_dir
+_contents_dir = _exec_dir.parent
+
+_search_dirs = [
+    _bundle_dir,
+    _exec_dir,
+    _contents_dir / "Frameworks",
+    _contents_dir / "Resources",
+    _bundle_dir / "_internal",
+    Path(__file__).resolve().parent,
+    Path.cwd(),
+]
+
+
+def _resolve_binary(binary_name: str) -> str | None:
+    """在运行时包内、可执行文件同级及 PATH 中解析可执行二进制。"""
+    for d in _search_dirs:
+        cand = d / binary_name
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand.resolve())
+        cand_exe = d / f"{binary_name}.exe"
+        if cand_exe.is_file() and os.access(cand_exe, os.X_OK):
+            return str(cand_exe.resolve())
+    candidate = shutil.which(binary_name)
+    if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+# ──────────────────────────────────────────────────────────────
+# FFmpeg / FFprobe 路径初始化
+# 优先使用包内或项目目录下的原生 macOS arm64 静态 ffmpeg 单文件
+# ──────────────────────────────────────────────────────────────
+_ffmpeg_bin = _resolve_binary("ffmpeg")
+if not _ffmpeg_bin:
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+        _ffmpeg_bin = _resolve_binary("ffmpeg")
+    except Exception:
+        pass
+
+FFMPEG_LOCATION: str = _ffmpeg_bin if _ffmpeg_bin else os.path.abspath("ffmpeg")
+
+_ffprobe_bin = _resolve_binary("ffprobe")
+FFPROBE_LOCATION: str | None = _ffprobe_bin
+
+# 确保运行时目录、可执行目录与 ffmpeg 所在目录置于 PATH 最前排，防止系统老旧 ffmpeg 抢占
+_paths_to_prepend = [
+    str(_bundle_dir),
+    str(_exec_dir),
+    str(Path(FFMPEG_LOCATION).parent) if FFMPEG_LOCATION else None,
+    str(_contents_dir / "Frameworks"),
+    str(_contents_dir / "Resources"),
+    str(_bundle_dir / "_internal"),
+]
+for p in reversed(_paths_to_prepend):
+    if p and os.path.isdir(p):
+        os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
+
+
+# ──────────────────────────────────────────────────────────────
+# Node.js 运行时探测（用于 yt-dlp-ejs 解密 YouTube n-challenge）
+# ──────────────────────────────────────────────────────────────
+def _resolve_node() -> str | None:
+    """返回可用的 Node.js 可执行文件路径。"""
+    for candidate in [shutil.which("node"), "/usr/local/bin/node", "/opt/homebrew/bin/node"]:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+NODE_LOCATION: str | None = _resolve_node()
+
+
+# ──────────────────────────────────────────────────────────────
+# aria2c 路径初始化（用于 16 线程极速并发拉流）
+# 优先使用包内或项目目录下的原生 macOS arm64 静态 aria2c 单文件
+# ──────────────────────────────────────────────────────────────
+def _resolve_aria2c() -> str | None:
+    return _resolve_binary("aria2c")
+
+
+ARIA2C_LOCATION: str | None = _resolve_aria2c()
+
+
+# ──────────────────────────────────────────────────────────────
+# Cookie 自动探测与管理体系
+# ──────────────────────────────────────────────────────────────
+_CURRENT_COOKIE_FILE: Path | None = None
+_CURRENT_BROWSER: str | None = None
+
+
+def is_valid_cookie_file(path: Path | str | None) -> bool:
+    """验证文件是否存在、非空且可正常读取。"""
+    if not path:
+        return False
+    p = Path(path)
+    try:
+        if not p.is_file() or p.stat().st_size == 0:
+            return False
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            chunk = f.read(1024)
+            return len(chunk.strip()) > 0
+    except Exception:
+        return False
+
+
+def get_cookie_search_paths() -> list[Path]:
+    """返回所有待探测的 cookies.txt 候选路径列表（按优先级排列）。"""
+    home = Path.home()
+    candidates: list[Path] = []
+    # 1. 项目根目录 / 打包资源目录 / 当前运行环境目录中的 cookies.txt 及常见扩展命名
+    cookie_names = ["cookies.txt", "www.youtube.com_cookies.txt", "youtube.com_cookies.txt", "youtube_cookies.txt"]
+    for d in _search_dirs:
+        for name in cookie_names:
+            cand = d / name
+            if cand not in candidates:
+                candidates.append(cand)
+
+    # 2. 用户标准配置目录 ~/.config/yt-dlp/cookies.txt
+    candidates.append(home / ".config" / "yt-dlp" / "cookies.txt")
+
+    # 3. 用户下载目录 ~/Downloads/ 下的标准命名与动态扫描
+    downloads = home / "Downloads"
+    for name in cookie_names:
+        cand = downloads / name
+        if cand not in candidates:
+            candidates.append(cand)
+    try:
+        if downloads.is_dir():
+            for p in sorted(downloads.glob("*cookie*.txt"), key=lambda x: x.stat().st_mtime, reverse=True):
+                if p not in candidates:
+                    candidates.append(p)
+    except Exception:
+        pass
+
+    # 4. 用户主目录相关备选 ~/.yt-dlp/cookies.txt 与 ~/cookies.txt
+    candidates.append(home / ".yt-dlp" / "cookies.txt")
+    candidates.append(home / "cookies.txt")
+    return candidates
+
+
+def resolve_cookies_path() -> Path | None:
+    """按优先级寻找首个有效的 cookies.txt 文件。"""
+    for p in get_cookie_search_paths():
+        try:
+            if is_valid_cookie_file(p):
+                return p.resolve()
+        except Exception:
+            continue
+    return None
+
+
+_CURRENT_COOKIE_FILE: Path | None = None
+_CURRENT_BROWSER: str | None = None
+_COOKIE_DISABLED: bool = False
+
+
+def get_current_cookie_file() -> Path | None:
+    """返回当前激活的 cookies.txt 文件路径（若有）。"""
+    global _CURRENT_COOKIE_FILE, _COOKIE_DISABLED
+    if _COOKIE_DISABLED:
+        return None
+    if _CURRENT_COOKIE_FILE and is_valid_cookie_file(_CURRENT_COOKIE_FILE):
+        return _CURRENT_COOKIE_FILE
+    found = resolve_cookies_path()
+    if found:
+        _CURRENT_COOKIE_FILE = found
+    return _CURRENT_COOKIE_FILE
+
+
+def set_current_cookie_file(path: Path | str | None) -> bool:
+    """设置或更换当前的 cookiefile 路径。"""
+    global _CURRENT_COOKIE_FILE, _COOKIE_DISABLED
+    _COOKIE_DISABLED = False
+    if path and is_valid_cookie_file(path):
+        _CURRENT_COOKIE_FILE = Path(path).resolve()
+        return True
+    _CURRENT_COOKIE_FILE = None
+    return False
+
+
+def set_browser_cookie(browser_name: str | None):
+    """设置从本地浏览器读取 Cookie（如 'chrome', 'safari', 'edge', 'firefox'）。"""
+    global _CURRENT_BROWSER, _COOKIE_DISABLED
+    _COOKIE_DISABLED = False
+    _CURRENT_BROWSER = browser_name.strip().lower() if browser_name else None
+
+
+def get_browser_cookie() -> str | None:
+    """获取当前配置的本地浏览器名称。"""
+    global _COOKIE_DISABLED
+    if _COOKIE_DISABLED:
+        return None
+    return _CURRENT_BROWSER
+
+
+def has_valid_cookie() -> bool:
+    """当前是否配置了有效的 Cookie（文件或浏览器来源）。"""
+    global _COOKIE_DISABLED
+    if _COOKIE_DISABLED:
+        return False
+    return (get_current_cookie_file() is not None) or bool(_CURRENT_BROWSER)
+
+
+def save_imported_cookie(source_path: str | Path) -> Path:
+    """
+    将用户选择的 cookies.txt 安全持久化到应用环境与用户标准配置目录。
+    返回保存的目标路径。
+    """
+    global _COOKIE_DISABLED
+    _COOKIE_DISABLED = False
+    src = Path(source_path).resolve()
+    if not is_valid_cookie_file(src):
+        raise ValueError(f"所选文件无效或为空: {src}")
+
+    # 优先拷贝到当前工作目录/项目目录下的 cookies.txt
+    target = Path.cwd() / "cookies.txt"
+    try:
+        shutil.copy2(src, target)
+    except Exception:
+        target = Path.home() / ".config" / "yt-dlp" / "cookies.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+
+    # 同时向 ~/.config/yt-dlp/cookies.txt 备份一份，确保 yt-dlp 全局可复用
+    try:
+        cfg_target = Path.home() / ".config" / "yt-dlp" / "cookies.txt"
+        if cfg_target.resolve() != target.resolve():
+            cfg_target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, cfg_target)
+    except Exception:
+        pass
+
+    set_current_cookie_file(target)
+    return target
+
+
+def clear_current_cookie() -> bool:
+    """清理当前生效的 Cookie 文件与浏览器配置，重置为未登录状态。"""
+    global _CURRENT_COOKIE_FILE, _CURRENT_BROWSER, _COOKIE_DISABLED
+    _COOKIE_DISABLED = True
+    _CURRENT_BROWSER = None
+    files_to_remove = set()
+    if _CURRENT_COOKIE_FILE:
+        files_to_remove.add(Path(_CURRENT_COOKIE_FILE).resolve())
+
+    cwd_cookie = (Path.cwd() / "cookies.txt").resolve()
+    files_to_remove.add(cwd_cookie)
+    cfg_cookie = (Path.home() / ".config" / "yt-dlp" / "cookies.txt").resolve()
+    files_to_remove.add(cfg_cookie)
+
+    for f in files_to_remove:
+        # 保护用户 Downloads 目录下的原始文件不被直接删除，仅从当前应用状态中解绑
+        if "Downloads" not in str(f):
+            try:
+                if f.exists() and f.is_file():
+                    f.unlink()
+            except Exception:
+                pass
+
+    _CURRENT_COOKIE_FILE = None
+    return True
+
+
+def get_base_ydl_opts(cookie_file: str | Path | None = None, browser: str | None = None) -> dict:
+    """返回所有 yt-dlp 任务通用的基础反爬与环境配置（支持自动 Cookie 探测与浏览器注入）。"""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        **({"ffmpeg_location": FFMPEG_LOCATION} if FFMPEG_LOCATION else {}),
+        "prefer_ffmpeg": True,
+        **({"js_runtimes": {"node": {"path": NODE_LOCATION}}} if NODE_LOCATION else {}),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "mweb", "tv_samsung", "web"],
+            }
+        },
+    }
+
+    # 1. 优先使用传入参数或自动发现的 cookies.txt 文件
+    c_path = Path(cookie_file).resolve() if cookie_file else get_current_cookie_file()
+    if c_path and is_valid_cookie_file(c_path):
+        opts["cookiefile"] = str(c_path)
+    else:
+        # 2. 备用：若无 cookies.txt，则检查是否配置了从本地浏览器读取 Cookie
+        b_name = (browser if browser else get_browser_cookie())
+        if b_name:
+            opts["cookiesfrombrowser"] = (b_name, None, None, None)
+
+    return opts
+
+
+# ──────────────────────────────────────────────────────────────
+# 辅助函数：字节转换与链接提取
+# ──────────────────────────────────────────────────────────────
+def format_size(size_bytes: int | float | None) -> str:
+    """将字节数转换为人类可读的字符串，例如 439.7 MB、1.2 GB。"""
+    if not size_bytes or size_bytes <= 0:
+        return "--"
+    size = float(size_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0 or unit == "TB":
+            if unit in ["B", "KB"]:
+                return f"{int(size)} {unit}"
+            else:
+                return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "--"
+
+
+def extract_video_urls(raw_text: str) -> list[str]:
+    """从文本中提取所有合法的 YouTube 视频或播放列表链接。"""
+    import re
+    pattern = r'https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?[^\s&]+|shorts/[^\s&]+|playlist\?[^\s&]+)|youtu\.be/[^\s&]+)'
+    found = re.findall(pattern, raw_text)
+    seen = set()
+    result = []
+    for u in found:
+        clean_u = u.rstrip('.,;)"\'')
+        if clean_u not in seen:
+            seen.add(clean_u)
+            result.append(clean_u)
+
+    if not result:
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if line.startswith("http://") or line.startswith("https://"):
+                if line not in seen:
+                    seen.add(line)
+                    result.append(line)
+    return result
+
+
+# ──────────────────────────────────────────────────────────────
+# 视频信息解析与可用画质动态提取
+# ──────────────────────────────────────────────────────────────
+LANG_MAP = {
+    'zh-Hans': '简体中文', 'zh-CN': '简体中文', 'zh-SG': '简体中文', 'zh-Hans-CN': '简体中文',
+    'zh-Hant': '繁体中文', 'zh-TW': '繁体中文', 'zh-HK': '繁体中文', 'zh-Hant-TW': '繁体中文',
+    'zh': '中文',
+    'en': 'English', 'en-US': 'English', 'en-GB': 'English', 'en-CA': 'English',
+    'ja': '日语', 'ko': '韩语', 'es': '西班牙语',
+    'fr': '法语', 'de': '德语', 'ru': '俄语',
+    'it': '意大利语', 'pt': '葡萄牙语', 'ar': '阿拉伯语', 'hi': '印地语',
+}
+
+
+def extract_subtitles_info(info: dict) -> tuple[list[dict], str]:
+    """
+    从 yt-dlp 元数据中动态嗅探并提取该视频实际拥有的所有可用字幕语言列表。
+    返回: (available_subtitles, default_subtitle_code)
+    available_subtitles 结构: [{'code': 'none', 'name': '无字幕'}, {'code': 'zh-Hans', 'name': '简体中文'}, ...]
+    """
+    raw_subs: dict[str, list] = {}
+    if isinstance(info.get("subtitles"), dict):
+        raw_subs.update(info["subtitles"])
+    if isinstance(info.get("automatic_captions"), dict):
+        for k, v in info["automatic_captions"].items():
+            if k not in raw_subs:
+                raw_subs[k] = v
+
+    sub_list = [{"code": "none", "name": "无字幕"}]
+    used_names = set()
+    mapped_langs: list[dict] = []
+
+    # 1. 优先提取 LANG_MAP 中的高频语种
+    for code, name in LANG_MAP.items():
+        if code in raw_subs and name not in used_names:
+            mapped_langs.append({"code": code, "name": name})
+            used_names.add(name)
+
+    # 2. 补充其它语种（前缀匹配或原语种名）
+    for code, entries in raw_subs.items():
+        matched_name = None
+        for k, v in LANG_MAP.items():
+            if code.lower().startswith(k.lower()) and v not in used_names:
+                matched_name = v
+                break
+        if matched_name:
+            mapped_langs.append({"code": code, "name": matched_name})
+            used_names.add(matched_name)
+        elif code not in [m["code"] for m in mapped_langs]:
+            disp_name = None
+            if isinstance(entries, list) and entries:
+                disp_name = entries[0].get("name")
+            if not disp_name:
+                disp_name = code
+            if disp_name not in used_names and len(mapped_langs) < 18:
+                mapped_langs.append({"code": code, "name": disp_name})
+                used_names.add(disp_name)
+
+    sub_list.extend(mapped_langs)
+
+    # 若检测到除“无字幕”以外的任何有效字幕，追加“全部字幕”选项
+    if len(sub_list) > 1:
+        sub_list.append({"code": "all", "name": "全部字幕"})
+
+    # 默认语言选择：若有简体中文/中文，优先选中，否则默认“无字幕”
+    default_code = "none"
+    for item in sub_list:
+        if "简体中文" in item["name"] or item["name"] == "中文":
+            default_code = item["code"]
+            break
+
+    return sub_list, default_code
+
+
+def _extract_video_info_single_attempt(
+    url: str,
+    cookie_file: str | Path | None = None,
+    browser: str | None = None,
+) -> dict:
+    """
+    使用 yt-dlp 提取视频元数据，动态分析当前视频支持的所有分辨率及预估大小。
+    
+    返回结构：
+    {
+        "id": str,
+        "url": str,
+        "title": str,
+        "duration": int,
+        "duration_str": str,
+        "uploader": str,
+        "thumbnail": str,
+        "qualities": list[dict],
+    }
+    """
+    url = url.strip()
+    if not url:
+        raise ValueError("视频链接不能为空")
+
+    opts = get_base_ydl_opts(cookie_file=cookie_file, browser=browser)
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise ValueError("无法提取视频信息，请检查链接或网络代理。")
+
+            title = info.get("title") or "未知标题"
+        duration = info.get("duration") or 0
+        if duration:
+            m, s = divmod(int(duration), 60)
+            h, m = divmod(m, 60)
+            duration_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        else:
+            duration_str = "--:--"
+
+        uploader = info.get("uploader") or info.get("channel") or "YouTube"
+        thumbnail = info.get("thumbnail") or ""
+
+        # 遍历 formats 列表，过滤出所有有效的视频分辨率与 HDR 信息
+        formats = info.get("formats", [])
+
+        # 1. 提取最高音质音频流体积（audio_size）并标记当前视频是否原生提供 AAC/M4A 音轨
+        best_audio_size = 0
+        best_audio_abr = 0
+        has_native_aac = False
+        for f in formats:
+            if f.get("vcodec") == "none" and f.get("acodec") != "none":
+                acodec = str(f.get("acodec") or "").lower()
+                ext = str(f.get("ext") or "").lower()
+                if ext == "m4a" or "mp4a" in acodec or "aac" in acodec:
+                    has_native_aac = True
+                abr = f.get("abr") or f.get("tbr") or 0
+                sz = f.get("filesize") or f.get("filesize_approx")
+                if not sz and abr and duration:
+                    sz = int((abr * 1024 / 8) * duration)
+                if sz and sz > best_audio_size:
+                    best_audio_size = int(sz)
+                    best_audio_abr = abr
+                elif abr > best_audio_abr and duration:
+                    best_audio_abr = abr
+                    best_audio_size = int((abr * 1024 / 8) * duration)
+
+        if best_audio_size == 0 and duration:
+            best_audio_size = int((128 * 1024 / 8) * duration)
+
+        # 2. 按照 (height, is_hdr) 聚合最佳流，保留最高 fps 与最高码率
+        groups: dict[tuple[int, bool], dict] = {}
+
+        for f in formats:
+            h = f.get("height")
+            # 排除 storyboard、缩略图流、纯音频流
+            if not h or f.get("vcodec") == "none":
+                continue
+            if f.get("protocol") == "mhtml" or f.get("format_note") == "storyboard":
+                continue
+
+            fid = str(f.get("format_id") or "")
+            # 明确排除 642 及其他未解密/容易报错的问题流
+            if fid == "642":
+                continue
+
+            proto = str(f.get("protocol") or "")
+            # 判断是否为原生 DASH 流 (http/https) vs HLS (m3u8)
+            is_dash = 1 if (proto.startswith("http") and "m3u8" not in proto) else 0
+
+            dr = str(f.get("dynamic_range") or "")
+            note = str(f.get("format_note") or "")
+            is_hdr = "HDR" in dr.upper() or "HLG" in dr.upper() or "HDR" in note.upper()
+
+            fps = int(f.get("fps") or 30)
+            tbr = float(f.get("tbr") or 0)
+            vcodec = str(f.get("vcodec") or "")
+            is_avc = 1 if "avc" in vcodec.lower() else 0
+            key = (int(h), is_hdr)
+
+            if key not in groups:
+                groups[key] = f
+            else:
+                old_f = groups[key]
+                old_proto = str(old_f.get("protocol") or "")
+                old_is_dash = 1 if (old_proto.startswith("http") and "m3u8" not in old_proto) else 0
+                old_fps = int(old_f.get("fps") or 30)
+                old_tbr = float(old_f.get("tbr") or 0)
+                old_vcodec = str(old_f.get("vcodec") or "")
+                old_is_avc = 1 if "avc" in old_vcodec.lower() else 0
+
+                # 对 SDR 视频优先选择 avc1 编码流，保证 QuickTime 原生兼容
+                if not is_hdr:
+                    rank = (is_avc, is_dash, fps, tbr)
+                    old_rank = (old_is_avc, old_is_dash, old_fps, old_tbr)
+                else:
+                    rank = (is_dash, fps, tbr)
+                    old_rank = (old_is_dash, old_fps, old_tbr)
+
+                if rank > old_rank:
+                    groups[key] = f
+
+        # 人性化标签映射
+        height_labels = {
+            4320: "8K 4320p",
+            2160: "4K 2160p",
+            1440: "2K 1440p",
+            1080: "1080p",
+            720: "720p",
+            480: "480p",
+            360: "360p",
+            240: "240p",
+            144: "144p",
+        }
+
+        has_video_hdr = any(k[1] for k in groups.keys())
+        qualities: list[dict] = []
+        # 排序：按 height 降序，相同 height 时 is_hdr=True 优先，再按 fps 降序
+        sorted_keys = sorted(
+            groups.keys(),
+            key=lambda k: (k[0], 1 if k[1] else 0, int(groups[k].get("fps") or 30)),
+            reverse=True,
+        )
+
+        for key in sorted_keys:
+            f = groups[key]
+            h, is_hdr = key
+            fps = int(f.get("fps") or 30)
+            fid = f.get("format_id")
+            vcodec = f.get("vcodec") or ""
+
+            base_name = height_labels.get(h, f"{h}p")
+            if fps >= 50:
+                if h in (4320, 2160, 1440):
+                    tag = f"{base_name}60"
+                elif h == 1080:
+                    tag = "1080p60"
+                elif h == 720:
+                    tag = "720p60"
+                else:
+                    tag = f"{h}p{fps}"
+            else:
+                tag = base_name
+
+            label = f"{tag} HDR" if is_hdr else tag
+
+            # 预估体积大小：优先获取 filesize / filesize_approx；若无则通过 (tbr * 1024 / 8) * duration 动态估算
+            v_size = f.get("filesize") or f.get("filesize_approx")
+            if not v_size and duration:
+                tbr = f.get("tbr") or 0
+                if tbr > 0:
+                    v_size = int((tbr * 1024 / 8) * duration)
+                else:
+                    v_size = 0
+            total_size = (v_size or 0) + best_audio_size
+
+            qualities.append({
+                "label": label,
+                "height": h,
+                "fps": fps,
+                "is_hdr": is_hdr,
+                "video_has_hdr": has_video_hdr,
+                "has_native_aac": has_native_aac,
+                "format_id": fid,
+                "vcodec": vcodec,
+                "size_bytes": total_size,
+                "size_str": format_size(total_size),
+                "type": "video",
+            })
+
+        # 兜底：如果没有任何解析出来的视频轨（极少见），添加默认最高画质
+        if not qualities:
+            qualities.append({
+                "label": "最高画质 (MP4)",
+                "height": None,
+                "fps": 30,
+                "is_hdr": False,
+                "video_has_hdr": has_video_hdr,
+                "has_native_aac": has_native_aac,
+                "format_id": None,
+                "vcodec": None,
+                "size_bytes": 0,
+                "size_str": "--",
+                "type": "video",
+            })
+
+        # 最后添加音频提取选项
+        qualities.append({
+            "label": "仅提取音频 (高质量 MP3)",
+            "height": None,
+            "fps": None,
+            "is_hdr": False,
+            "video_has_hdr": has_video_hdr,
+            "has_native_aac": has_native_aac,
+            "format_id": None,
+            "vcodec": None,
+            "size_bytes": best_audio_size,
+            "size_str": format_size(best_audio_size),
+            "type": "audio",
+        })
+
+        available_subs, default_sub_code = extract_subtitles_info(info)
+
+        return {
+            "id": info.get("id"),
+            "url": url,
+            "title": title,
+            "duration": duration,
+            "duration_str": duration_str,
+            "uploader": uploader,
+            "thumbnail": thumbnail,
+            "has_native_aac": has_native_aac,
+            "has_hdr": has_video_hdr,
+            "qualities": qualities,
+            "available_subtitles": available_subs,
+            "selected_subtitle": default_sub_code,
+            "subtitles": info.get("subtitles", {}),
+            "automatic_captions": info.get("automatic_captions", {}),
+        }
+    except yt_dlp.utils.DownloadError as exc:
+        msg = str(exc)
+        if "Sign in" in msg or "bot" in msg.lower() or "confirm" in msg.lower():
+            raise ValueError(
+                "YouTube 要求登录验证（反爬风控拦截）。\n"
+                "已拦截未登录请求，请点击右上角【导入 Cookie】载入 YouTube 登录状态。"
+            ) from exc
+        raise
+
+
+def get_video_info(
+    url: str,
+    cookie_file: str | Path | None = None,
+    browser: str | None = None,
+    max_retries: int = 3,
+    retry_delay: float = 1.0,
+    on_status_callback: Callable[[str], None] | None = None,
+) -> dict:
+    """
+    带自动重试机制的视频信息解析函数。
+    支持最多重试 max_retries 次（默认 3 次），阶梯退避延迟。
+    若存在 status 回调，在重试时通知调用方。
+    """
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1 and on_status_callback:
+                on_status_callback(f"连接波动，正在尝试第 {attempt}/{max_retries} 次解析...")
+
+            info = _extract_video_info_single_attempt(
+                url=url,
+                cookie_file=cookie_file,
+                browser=browser,
+            )
+            if info:
+                return info
+        except Exception as e:
+            last_exception = e
+            print(f"[解析重试 {attempt}/{max_retries}] 发生异常: {e}")
+            if attempt < max_retries:
+                # 阶梯避让延迟: 1.0s, 1.5s, 2.0s...
+                sleep_time = retry_delay * (1 + (attempt - 1) * 0.5)
+                time.sleep(sleep_time)
+            else:
+                msg = str(e)
+                if "Sign in" in msg or "bot" in msg.lower() or "confirm" in msg.lower() or "登录" in msg or "风控" in msg:
+                    raise ValueError(
+                        f"该视频在重试 {max_retries} 次后仍无法解析：YouTube 要求登录验证（反爬风控拦截）。\n"
+                        f"请点击右上角【导入 Cookie】载入 YouTube 登录状态后再试。"
+                    ) from e
+                raise ValueError(
+                    f"该视频在重试 {max_retries} 次后仍无法解析：{msg}"
+                ) from e
+
+    if last_exception:
+        raise last_exception
+    raise RuntimeError(f"该视频在重试 {max_retries} 次后仍未返回有效信息。")
+
+
+def parse_playlist_or_videos(
+    raw_text: str,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    cookie_file: str | Path | None = None,
+    browser: str | None = None,
+) -> list[dict]:
+    """
+    支持多 URL（换行分隔）或播放列表链接批量解析。
+    返回每个有效视频的完整元数据字典列表。
+    """
+    urls = extract_video_urls(raw_text)
+    if not urls:
+        raise ValueError("未检测到有效的 YouTube 视频或播放列表链接。")
+
+    resolved_urls: list[str] = []
+    opts = get_base_ydl_opts(cookie_file=cookie_file, browser=browser)
+
+    # 1. 展开播放列表
+    for u in urls:
+        if "list=" in u:
+            try:
+                with yt_dlp.YoutubeDL({**opts, "extract_flat": True}) as ydl:
+                    pl_info = ydl.extract_info(u, download=False)
+                    entries = pl_info.get("entries") or []
+                    for entry in entries[:50]:  # 限制单次最多提取 50 个视频，保护网络与防风控
+                        if entry:
+                            v_id = entry.get("id") or entry.get("url")
+                            if v_id:
+                                v_url = v_id if v_id.startswith("http") else f"https://www.youtube.com/watch?v={v_id}"
+                                if v_url not in resolved_urls:
+                                    resolved_urls.append(v_url)
+            except Exception:
+                if u not in resolved_urls:
+                    resolved_urls.append(u)
+        else:
+            if u not in resolved_urls:
+                resolved_urls.append(u)
+
+    total = len(resolved_urls)
+    results: list[dict] = []
+
+    for idx, v_url in enumerate(resolved_urls, 1):
+        if on_progress:
+            if total == 1:
+                on_progress(idx, total, "正在解析视频可用画质与数据，请稍候...")
+            else:
+                on_progress(idx, total, f"正在解析 ({idx}/{total}): {v_url[:60]}...")
+
+        # 定义每个视频重试时的状态更新回调
+        def _item_retry_cb(status_msg: str, _idx=idx, _tot=total):
+            if on_progress:
+                if _tot == 1:
+                    on_progress(_idx, _tot, status_msg)
+                else:
+                    on_progress(_idx, _tot, f"({_idx}/{_tot}) {status_msg}")
+
+        try:
+            info = get_video_info(
+                v_url,
+                cookie_file=cookie_file,
+                browser=browser,
+                max_retries=3,
+                retry_delay=1.0,
+                on_status_callback=_item_retry_cb,
+            )
+            # 单独 try/except 隔离：确保单个 URL 解析失败绝不中断整个循环
+            if info and info.get("id"):
+                info["quality_options"] = info.get("qualities") or []
+                info["custom_quality"] = False
+                results.append(info)
+            else:
+                results.append({
+                    "id": None,
+                    "url": v_url,
+                    "title": "解析失败（无有效信息）",
+                    "duration": 0,
+                    "duration_str": "--:--",
+                    "uploader": "YouTube",
+                    "thumbnail": "",
+                    "qualities": [],
+                    "error": "未返回有效视频信息",
+                })
+        except Exception as e:
+            err_str = str(e)
+            print(f"[parse] 第 {idx} 个链接解析失败: {v_url}\n  错误: {err_str}")
+            results.append({
+                "id": None,
+                "url": v_url,
+                "title": "解析失败",
+                "duration": 0,
+                "duration_str": "--:--",
+                "uploader": "YouTube",
+                "thumbnail": "",
+                "qualities": [],
+                "error": err_str,
+            })
+
+        # 每次请求之间加入微延迟，避免瞬间高并发触发 YouTube 频率拦截
+        if idx < total:
+            time.sleep(0.3)
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────
+# 静态预设兼容字典（向后兼容旧调用）
+# ──────────────────────────────────────────────────────────────
+BESTAUDIO_RULE = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio"
+
+FORMAT_PRESETS = {
+    "最高画质 (MP4)": {
+        "format": (
+            f"bestvideo[vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[vcodec^=avc]+{BESTAUDIO_RULE}/"
+            f"bestvideo*+{BESTAUDIO_RULE}/best"
+        ),
+        "merge_output_format": "mp4",
+    },
+    "标准 1080P (MP4)": {
+        "format": (
+            f"bestvideo[height=1080][vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[height<=1080][vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[height<=1080]+{BESTAUDIO_RULE}"
+        ),
+        "merge_output_format": "mp4",
+    },
+    "标准 720P (MP4)": {
+        "format": (
+            f"bestvideo[height=720][vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[height<=720][vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[vcodec^=avc1]+{BESTAUDIO_RULE}/"
+            f"bestvideo[height<=720]+{BESTAUDIO_RULE}"
+        ),
+        "merge_output_format": "mp4",
+    },
+    "仅提取音频 (MP3)": {
+        "format": "bestaudio/best",
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            },
+            {"key": "FFmpegMetadata"},
+            {"key": "EmbedThumbnail"},
+        ],
+        "writethumbnail": True,
+    },
+}
+
+
+# ──────────────────────────────────────────────────────────────
+# 动态网络带宽探测与并发自适应策略
+# ──────────────────────────────────────────────────────────────
+def detect_network_speed(test_url: str | None, timeout: float = 3.0) -> tuple[float, float]:
+    """
+    轻量带宽探测函数：
+    通过 Range 头请求 1MB 切片数据，快速测出当前访问 YouTube CDN 的实际吞吐量。
+    耗时控制在 0.5 秒内。
+    返回 (speed_mb_s, speed_mbps)。
+    若探测超时或失败，默认回退为 100M 宽带标准 (10.0 MB/s, 80.0 Mbps)。
+    """
+    DEFAULT_SPEED_MB = 10.0  # 约 10 MB/s (100M 宽带标准)
+    DEFAULT_MBPS = 80.0
+
+    if not test_url or not isinstance(test_url, str) or not test_url.startswith("http"):
+        return DEFAULT_SPEED_MB, DEFAULT_MBPS
+
+    target_bytes = 1024 * 1024  # 1MB
+    headers = {
+        "Range": f"bytes=0-{target_bytes - 1}",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    try:
+        req = urllib.request.Request(test_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            t0 = time.perf_counter()
+            bytes_read = 0
+            # 分块读取，若耗时达 0.5 秒且已读取至少 64KB 则提前结算，控制在 0.5 秒内极速响应
+            while bytes_read < target_bytes:
+                chunk = resp.read(min(65536, target_bytes - bytes_read))
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if (time.perf_counter() - t0) >= 0.5 and bytes_read >= 65536:
+                    break
+
+            elapsed = time.perf_counter() - t0
+            if elapsed > 0 and bytes_read > 0:
+                speed_mb_s = (bytes_read / 1048576.0) / elapsed
+                speed_mbps = speed_mb_s * 8.0
+                return round(speed_mb_s, 2), round(speed_mbps, 1)
+
+    except Exception:
+        pass
+
+    return DEFAULT_SPEED_MB, DEFAULT_MBPS
+
+
+def get_adaptive_download_config(speed_mb_s: float) -> tuple[int, int]:
+    """
+    根据实测速率动态决定 ydl_opts 中的并发与缓冲区参数：
+    - < 5 MB/s (约 50M 以下)：concurrent_fragment_downloads = 2, buffersize = 256KB
+    - 5 ~ 15 MB/s (约 100M 宽带)：concurrent_fragment_downloads = 3, buffersize = 512KB
+    - 15 ~ 35 MB/s (约 200M~300M 宽带)：concurrent_fragment_downloads = 6, buffersize = 1MB
+    - > 35 MB/s (500M~千兆宽带)：concurrent_fragment_downloads = 8, buffersize = 2MB
+    """
+    if speed_mb_s < 5.0:
+        return 2, 256 * 1024
+    elif speed_mb_s < 15.0:
+        return 3, 512 * 1024
+    elif speed_mb_s <= 35.0:
+        return 6, 1024 * 1024
+    else:
+        return 8, 2 * 1024 * 1024
+
+
+class DownloadTask:
+    """
+    封装单次下载任务。
+    支持传入动态 quality_dict 或传统 format_name。
+    通过回调函数向 GUI 层推送状态更新，确保线程安全。
+    """
+
+    def __init__(
+        self,
+        url: str,
+        quality: dict | str,
+        save_dir: str,
+        on_progress: Callable[[dict], None],
+        on_status: Callable[[str, str], None],
+        on_complete: Callable[[str | None], None] | Callable[[], None],
+        on_error: Callable[[str], None],
+        enable_hdr: bool | None = None,
+        enable_subtitles: bool = False,
+        subtitle_lang: str | None = None,
+    ):
+        self.url = url.strip()
+        self.quality = quality
+        self.save_dir = save_dir
+        self.on_progress = on_progress
+        self.on_status = on_status
+        self.on_complete = on_complete
+        self.on_error = on_error
+        self.enable_hdr = enable_hdr
+        self.subtitle_lang = subtitle_lang
+        if subtitle_lang is not None:
+            self.enable_subtitles = bool(subtitle_lang != "none" and subtitle_lang)
+        else:
+            self.enable_subtitles = bool(enable_subtitles)
+        self.final_output_path: str | None = None
+        self._cancelled = threading.Event()
+        self._completed = False
+        self._cleaned_up = False
+        self._thread: threading.Thread | None = None
+        self._last_percent: float = 0.0
+        self._last_speed_mb: float = 0.0
+        self._speed_ema_mb: float = 0.0
+        self._last_calc_time: float = 0.0
+        self._last_calc_bytes: int = 0
+        self._start_download_time: float = 0.0
+        self._total_bytes: int | None = None
+        self.active_temp_files: set[str] = set()
+        self.has_valid_cookie: bool = has_valid_cookie()
+
+    # ── 公开接口 ──────────────────────────────────────────────
+
+    def start(self):
+        """在后台线程中启动下载。"""
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="yt-dlp-worker"
+        )
+        self._thread.start()
+
+    def cancel(self):
+        """请求取消下载，并异步彻底清理未完成的临时文件。"""
+        self._cancelled.set()
+        threading.Thread(target=self._cleanup_temp_files, daemon=True).start()
+
+    def _cleanup_temp_files(self):
+        """取消下载时彻底清理未完成的临时文件（.part、.ytdl、.aria2 及未混流的分轨文件）。"""
+        # 稍微延迟 0.2 秒，确保 yt-dlp 与 aria2c/ffmpeg 进程完全释放文件句柄
+        time.sleep(0.2)
+
+        # 1. 优先清理显式记录的临时文件
+        for file_path in list(self.active_temp_files):
+            try:
+                p = Path(file_path)
+                if p.exists() and p.is_file():
+                    os.remove(p)
+                for ext in [".part", ".aria2", ".ytdl"]:
+                    sidecar = Path(f"{file_path}{ext}")
+                    if sidecar.exists() and sidecar.is_file():
+                        os.remove(sidecar)
+            except Exception:
+                pass
+
+        # 2. 目录兜底扫描：根据当前任务的 save_dir 扫描未完成的临时文件
+        try:
+            save_path = Path(self.save_dir)
+            if save_path.exists() and save_path.is_dir():
+                patterns = ["*.part", "*.ytdl", "*.aria2", "*.f*.mp4", "*.f*.webm", "*.f*.m4a"]
+                for pat in patterns:
+                    for temp_file in save_path.glob(pat):
+                        try:
+                            if temp_file.is_file():
+                                os.remove(temp_file)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def _finish(self, final_path: str | None = None):
+        """线程安全的单次完成回调。"""
+        if not self._completed and not self._cancelled.is_set():
+            self._completed = True
+            if final_path:
+                self.final_output_path = final_path
+            self.on_progress({"percent": 100, "speed_mb": 0, "eta_str": "00:00", "status": "done"})
+            self.on_status("下载完成：视频已成功保存", "success")
+            try:
+                self.on_complete(self.final_output_path)
+            except TypeError:
+                self.on_complete()
+
+    # ── 内部实现 ──────────────────────────────────────────────
+
+    def _run(self):
+        try:
+            self._do_download()
+        except yt_dlp.utils.DownloadCancelled:
+            self._cleanup_temp_files()
+            self.on_status("已取消下载，已自动清理临时文件", "warning")
+        except yt_dlp.utils.DownloadError as exc:
+            if self._cancelled.is_set():
+                self._cleanup_temp_files()
+                self.on_status("已取消下载，已自动清理临时文件", "warning")
+                return
+            msg = str(exc)
+            if "ffmpeg" in msg.lower() or "ffprobe" in msg.lower():
+                friendly = (
+                    "未找到 FFmpeg！\n"
+                    "请确认项目目录下存在 ffmpeg 可执行文件且具备权限。\n\n"
+                    f"详情：{msg}"
+                )
+            elif "Sign in" in msg or "bot" in msg.lower() or "confirm" in msg.lower():
+                friendly = (
+                    "YouTube 要求登录验证（反爬风控拦截）。\n\n"
+                    "已拦截未登录请求，请点击右上角【导入 Cookie】载入 YouTube 登录状态。\n\n"
+                    "建议：\n"
+                    "① 点击右上角【导入 Cookie】导入有效 cookies.txt\n"
+                    "② 或稍后重试 / 更换公开无限制的视频链接"
+                )
+            elif "HTTP Error 403" in msg:
+                friendly = "访问被拒绝 (HTTP 403)，可能视频有地区或年龄限制。"
+            elif "Video unavailable" in msg or "unavailable" in msg.lower():
+                friendly = "视频不可用：可能已被删除或设为私密。"
+            else:
+                friendly = f"下载失败：{msg}"
+            self.on_error(friendly)
+        except Exception as exc:
+            if self._cancelled.is_set():
+                self._cleanup_temp_files()
+                self.on_status("已取消下载，已自动清理临时文件", "warning")
+                return
+            self.on_error(f"未知错误：{type(exc).__name__}: {exc}")
+        finally:
+            if self._cancelled.is_set():
+                self._cleanup_temp_files()
+
+    def _build_opts(self) -> dict:
+        """根据用户选中的清晰度与字幕偏好构造最佳 yt-dlp 配置参数。"""
+        base_opts = get_base_ydl_opts()
+        self.has_valid_cookie = bool("cookiefile" in base_opts or "cookiesfrombrowser" in base_opts)
+
+        # 确定实际生效的字幕语言代号与输出模板
+        sub_code = getattr(self, "subtitle_lang", None)
+        if sub_code is None:
+            sub_code = "zh-Hans" if self.enable_subtitles else "none"
+
+        is_sub_enabled = bool(sub_code != "none" and sub_code)
+
+        # 视频与字幕同名独立子目录归档逻辑：当开启字幕时存入同名子目录，未开启时平铺保存
+        if is_sub_enabled:
+            outtmpl = str(Path(self.save_dir) / "%(title)s" / "%(title)s.%(ext)s")
+        else:
+            outtmpl = str(Path(self.save_dir) / "%(title)s.%(ext)s")
+
+        ydl_opts = {
+            **base_opts,
+            "outtmpl": outtmpl,
+            "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
+            "concurrent_fragment_downloads": 6,
+            "buffersize": 1024 * 1024,
+            "retries": 10,
+            "fragment_retries": 10,
+            "writethumbnail": True,
+        }
+
+        # 智能字幕配置
+        if is_sub_enabled:
+            if sub_code == "all":
+                target_langs = ["all"]
+            elif sub_code in ("zh-Hans", "zh-CN"):
+                target_langs = ["zh-Hans", "zh-CN", "zh"]
+            elif sub_code in ("zh-Hant", "zh-TW", "zh-HK"):
+                target_langs = ["zh-Hant", "zh-TW", "zh-HK"]
+            else:
+                target_langs = [sub_code]
+
+            ydl_opts.update({
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": target_langs,
+                "subtitlesformat": "srt",
+            })
+        else:
+            ydl_opts.update({
+                "writesubtitles": False,
+                "writeautomaticsub": False,
+            })
+
+        # 1. 如果传入的是字典（新版动态画质对象）
+        if isinstance(self.quality, dict):
+            q_type = self.quality.get("type", "video")
+            if q_type == "audio":
+                ydl_opts.update({
+                    "format": "bestaudio/best",
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        },
+                        {"key": "FFmpegMetadata"},
+                        {
+                            "key": "FFmpegThumbnailsConvertor",
+                            "format": "jpg",
+                        },
+                        {
+                            "key": "EmbedThumbnail",
+                            "already_have_thumbnail": False,
+                        },
+                    ],
+                })
+            else:
+                format_id = self.quality.get("format_id")
+                height = self.quality.get("height")
+                label = str(self.quality.get("label") or "")
+                is_hdr_quality = bool(self.quality.get("is_hdr", False)) or ("HDR" in label.upper())
+                video_supports_hdr = bool(self.quality.get("video_has_hdr", False)) or is_hdr_quality
+
+                bestaudio_rule = "(bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio)"
+
+                # 决定当前任务是否以 HDR 模式抓取与混流：
+                # 1. 若显式传入 enable_hdr：勾选了 HDR 且视频确实支持 HDR 才下载 HDR；否则自动回退至普通 SDR 流程
+                # 2. 若未显式传入 enable_hdr（如单视频列表直接选中画质项）：按所选规格自身是否为 HDR 决定
+                if self.enable_hdr is not None:
+                    should_hdr = bool(self.enable_hdr and video_supports_hdr)
+                else:
+                    should_hdr = is_hdr_quality
+
+                # 【情况 B：已勾选“下载 HDR”（若支持 HDR，抓取 HDR 视频轨 + 原生 AAC 音轨，采用 MKV 容器并保持原画拷贝）】
+                if should_hdr:
+                    # 1. 容器参数：采用 mkv
+                    merge_format = "mkv"
+                    # 2. 混流参数：原画零转码拷贝
+                    merger_args = ["-c", "copy"]
+
+                    # 3. 流筛选：抓取 HDR 最佳视频轨（VP9.2 / AV1 10-bit） + 原生 AAC 音轨
+                    if height:
+                        format_str = (
+                            f"bestvideo[height={height}][dynamic_range=HDR]+{bestaudio_rule}/"
+                            f"bestvideo[height<={height}][dynamic_range=HDR]+{bestaudio_rule}"
+                        )
+                        if format_id and is_hdr_quality and str(format_id) != "642":
+                            format_str = f"{format_id}+{bestaudio_rule}/" + format_str
+                    else:
+                        format_str = (
+                            f"bestvideo[dynamic_range=HDR]+{bestaudio_rule}/"
+                            f"bestvideo[dynamic_range~='(?i)HDR|HLG']+{bestaudio_rule}/"
+                            f"bestvideo*+{bestaudio_rule}/best"
+                        )
+
+                # 【情况 A：未勾选“下载 HDR”或视频无 HDR（强行输出 QuickTime 兼容的普通 SDR MP4）】
+                else:
+                    # 1. 容器参数：强制输出 mp4
+                    merge_format = "mp4"
+
+                    # 2. 初始混流参数安全预设
+                    vcodec = str(self.quality.get("vcodec") or "").lower() if isinstance(self.quality, dict) else ""
+                    is_avc = vcodec.startswith("avc1") or vcodec.startswith("avc")
+                    has_native_aac = bool(self.quality.get("has_native_aac", True)) if isinstance(self.quality, dict) else True
+
+                    if is_avc or not vcodec:
+                        if has_native_aac:
+                            merger_args = ["-c", "copy"]
+                        else:
+                            aac_enc = "aac_at" if sys.platform == "darwin" else "aac"
+                            merger_args = ["-c:v", "copy", "-c:a", aac_enc, "-threads", "0"]
+                    else:
+                        # 针对非 avc1 视频（如用户选了 2K/4K SDR 只能抓到 vp09/av01 时），调用 macOS VideoToolbox 硬解转码
+                        audio_cmd = ["-c:a", "copy"] if has_native_aac else ["-c:a", "aac_at" if sys.platform == "darwin" else "aac"]
+                        if sys.platform == "darwin":
+                            video_cmd = ["-c:v", "h264_videotoolbox", "-b:v", "10M"]
+                        else:
+                            video_cmd = ["-c:v", "libx264", "-crf", "20", "-preset", "fast"]
+                        merger_args = video_cmd + audio_cmd
+
+                    # 3. 严格锁定 H.264 (avc1) 视频流与原生 AAC 音轨
+                    audio_selector = "(bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio)"
+                    target_height = height
+
+                    if target_height:
+                        if target_height > 1080:
+                            # 用户强选 2K/4K 但未勾选 HDR：优先匹配目标分辨率（通常为 vp09/av01），后续由 Merger 进行 VideoToolbox 硬解转码
+                            format_str = (
+                                f"bestvideo[height={target_height}]+{audio_selector}/"
+                                f"bestvideo[height<={target_height}][vcodec^=avc1]+{audio_selector}/"
+                                f"bestvideo[vcodec^=avc1]+{audio_selector}/"
+                                f"bestvideo[height<={target_height}]+{audio_selector}/"
+                                f"best[height<={target_height}]/best"
+                            )
+                        else:
+                            # 严格优先匹配目标分辨率的原生 H.264 (avc1) 视频
+                            format_str = (
+                                # 1. 优先匹配目标分辨率的原生 H.264 (avc1)
+                                f"bestvideo[height={target_height}][vcodec^=avc1]+{audio_selector}/"
+                                # 2. 兜底匹配小于等于目标分辨率的最佳原生 H.264
+                                f"bestvideo[height<={target_height}][vcodec^=avc1]+{audio_selector}/"
+                                # 3. 最终保底：直接拿最高清晰度的 avc1 流（最高通常为 1080p）
+                                f"bestvideo[vcodec^=avc1]+{audio_selector}/"
+                                # 4. 若该冷门视频实在没有任何 avc1（只有 vp09/av01）时再选最佳
+                                f"bestvideo[height<={target_height}]+{audio_selector}/"
+                                f"best[height<={target_height}]/best"
+                            )
+                    else:
+                        format_str = (
+                            f"bestvideo[vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[vcodec^=avc]+{audio_selector}/"
+                            f"bestvideo+{audio_selector}/best"
+                        )
+
+                # 高清封面内嵌与字幕后处理
+                video_postprocessors = [
+                    {
+                        "key": "FFmpegThumbnailsConvertor",
+                        "format": "jpg",
+                    },
+                    {
+                        "key": "EmbedThumbnail",
+                        "already_have_thumbnail": False,
+                    },
+                ]
+                if self.enable_subtitles and merge_format == "mkv":
+                    video_postprocessors.append({"key": "FFmpegSubtitlesEmbedder"})
+
+                ydl_opts.update({
+                    "format": format_str,
+                    "merge_output_format": merge_format,
+                    "postprocessor_args": {
+                        "Merger": merger_args,
+                    },
+                    "postprocessors": video_postprocessors,
+                })
+
+        # 2. 如果传入的是字符串（传统静态预设名称，向前兼容）
+        elif isinstance(self.quality, str):
+            preset = FORMAT_PRESETS.get(self.quality, FORMAT_PRESETS["最高画质 (MP4)"])
+            ydl_opts.update(preset)
+            if "仅提取音频" not in self.quality:
+                video_postprocessors = [
+                    {
+                        "key": "FFmpegThumbnailsConvertor",
+                        "format": "jpg",
+                    },
+                    {
+                        "key": "EmbedThumbnail",
+                        "already_have_thumbnail": False,
+                    },
+                ]
+                audio_selector = "(bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio)"
+                if self.enable_hdr is False:
+                    if "1080" in self.quality:
+                        target_h = 1080
+                    elif "720" in self.quality:
+                        target_h = 720
+                    else:
+                        target_h = None
+
+                    if target_h:
+                        ydl_opts["format"] = (
+                            f"bestvideo[height={target_h}][vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[height<={target_h}][vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[height<={target_h}]+{audio_selector}/"
+                            f"best[height<={target_h}]/best"
+                        )
+                    else:
+                        ydl_opts["format"] = (
+                            f"bestvideo[vcodec^=avc1]+{audio_selector}/"
+                            f"bestvideo[vcodec^=avc]+{audio_selector}/"
+                            f"bestvideo+{audio_selector}/best"
+                        )
+                    ydl_opts["merge_output_format"] = "mp4"
+                    ydl_opts["postprocessor_args"] = {"Merger": ["-c", "copy"]}
+                else:
+                    is_hdr = "HDR" in self.quality.upper() or (self.enable_hdr is True)
+                    merge_format = "mkv" if is_hdr else "mp4"
+                    merger_args = ["-c", "copy"]
+                    ydl_opts["merge_output_format"] = merge_format
+                    ydl_opts["postprocessor_args"] = {
+                        "Merger": merger_args,
+                    }
+                    if self.enable_subtitles and merge_format == "mkv":
+                        video_postprocessors.append({"key": "FFmpegSubtitlesEmbedder"})
+                ydl_opts["postprocessors"] = video_postprocessors
+
+        return ydl_opts
+
+    def _do_download(self):
+        ydl_opts = self._build_opts()
+        self.on_status("正在智能探测网络连接与带宽...", "info")
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            if self._cancelled.is_set():
+                self.on_status("下载已取消", "warning")
+                return
+
+            info = ydl.extract_info(self.url, download=False)
+            title = info.get("title", "未知标题")
+
+            # 寻找直链切片测速
+            stream_url = None
+            requested = info.get("requested_formats") or []
+            if requested:
+                stream_url = requested[0].get("url")
+            if not stream_url:
+                fmts = info.get("formats") or []
+                for f in reversed(fmts):
+                    if f.get("url") and f.get("protocol") == "https":
+                        stream_url = f.get("url")
+                        break
+
+            # 动态检测网络带宽并自适应分配最佳并发与缓存
+            speed_mb_s, speed_mbps = detect_network_speed(stream_url, timeout=3.0)
+            concurrent, buf_size = get_adaptive_download_config(speed_mb_s)
+
+            # 动态更新 ydl 参数
+            ydl.params.update({
+                "concurrent_fragment_downloads": concurrent,
+                "buffersize": buf_size,
+                "retries": 10,
+                "fragment_retries": 10,
+            })
+
+            self.on_status(
+                f"已识别网络环境 (~{int(speed_mbps)} Mbps)，自动开启 {concurrent} 线程极速并发分片下载",
+                "info",
+            )
+
+            if self._cancelled.is_set():
+                self.on_status("已取消下载，已自动清理临时文件", "warning")
+                self._cleanup_temp_files()
+                return
+
+            # 智能自适应合并参数校准与编码安全策略防护：
+            merge_fmt = ydl.params.get("merge_output_format", "mp4")
+            if merge_fmt == "mp4":
+                requested = info.get("requested_formats") or []
+                if not requested and info.get("vcodec"):
+                    requested = [info]
+
+                is_avc = False
+                is_aac = True
+                has_video = False
+
+                for rf in requested:
+                    vc = str(rf.get("vcodec") or "").lower()
+                    ac = str(rf.get("acodec") or "").lower()
+                    ext = str(rf.get("ext") or "").lower()
+
+                    if vc != "none":
+                        has_video = True
+                        if vc.startswith("avc1") or vc.startswith("avc"):
+                            is_avc = True
+
+                    if ac != "none" and vc == "none":
+                        if not (ext == "m4a" or "mp4a" in ac or "aac" in ac):
+                            is_aac = False
+
+                # 编码安全策略：
+                # 1. 如果抓取到的是原生 avc1 视频：保持零转码无损秒合流
+                if is_avc or not has_video:
+                    if is_aac:
+                        merger_args = ["-c", "copy"]
+                    else:
+                        aac_enc = "aac_at" if sys.platform == "darwin" else "aac"
+                        merger_args = ["-c:v", "copy", "-c:a", aac_enc, "-threads", "0"]
+                # 2. 防护检测（针对用户强选 2K/4K 但未勾选 HDR，只能抓到 vp09/av01 时）：
+                # 若视频编码确定非 avc1 且目标容器是 mp4，不能直接 -c:v copy，
+                # 必须调用 macOS 专属的 VideoToolbox 硬件编码器快速转为 QuickTime 兼容的 h264
+                else:
+                    audio_cmd = ["-c:a", "copy"] if is_aac else ["-c:a", "aac_at" if sys.platform == "darwin" else "aac"]
+                    if sys.platform == "darwin":
+                        video_cmd = ["-c:v", "h264_videotoolbox", "-b:v", "10M"]
+                    else:
+                        video_cmd = ["-c:v", "libx264", "-crf", "20", "-preset", "fast"]
+                    merger_args = video_cmd + audio_cmd
+                    self.on_status("检测到超清非 H.264 视频流，已自动启用 VideoToolbox 硬件加速转码...", "info")
+
+                ydl.params.setdefault("postprocessor_args", {})["Merger"] = merger_args
+
+            # 直接基于已提取的元数据启动下载，避免二次重复请求
+            ydl.process_ie_result(info, download=True)
+
+            # 捕获并记录 yt-dlp 最终合成生成的实际文件绝对路径 (final_output_path)
+            final_path = getattr(self, "final_output_path", None)
+            if not final_path or not os.path.exists(final_path):
+                try:
+                    prep_fn = ydl.prepare_filename(info)
+                    m_fmt = ydl.params.get("merge_output_format")
+                    if m_fmt:
+                        cand = str(Path(prep_fn).with_suffix(f".{m_fmt}"))
+                        if os.path.exists(cand):
+                            final_path = os.path.abspath(cand)
+                    if not final_path and os.path.exists(prep_fn):
+                        final_path = os.path.abspath(prep_fn)
+                except Exception:
+                    pass
+
+            if not final_path or not os.path.exists(final_path):
+                try:
+                    title = info.get("title")
+                    if title:
+                        save_p = Path(self.save_dir)
+                        clean_t = "".join(c for c in title if c.isalnum() or c in " _-")[:15]
+                        if save_p.exists() and clean_t:
+                            matches = [p for p in save_p.rglob(f"*{clean_t}*") if p.is_file() and p.suffix.lower() in (".mp4", ".mkv", ".mp3", ".webm")]
+                            if matches:
+                                matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                                final_path = str(matches[0].resolve())
+                except Exception:
+                    pass
+
+            self.final_output_path = final_path
+            self._finish(self.final_output_path)
+
+    def _progress_hook(self, d: dict):
+        """深度适配分片并发下载进度的回调逻辑。"""
+        if self._cancelled.is_set():
+            self._cleanup_temp_files()
+            raise yt_dlp.utils.DownloadCancelled()
+
+        # 动态收集正在写入的文件路径以便取消时能够精准清理
+        fn = d.get("filename")
+        if fn:
+            self.active_temp_files.add(fn)
+            self.active_temp_files.add(f"{fn}.part")
+            self.active_temp_files.add(f"{fn}.aria2")
+            self.active_temp_files.add(f"{fn}.ytdl")
+
+        tmpfn = d.get("tmpfilename")
+        if tmpfn:
+            self.active_temp_files.add(tmpfn)
+            self.active_temp_files.add(f"{tmpfn}.aria2")
+            self.active_temp_files.add(f"{tmpfn}.part")
+
+        status = d.get("status")
+
+        # 状态判断：只在 d['status'] == 'downloading' 时计算实时进度
+        if status == "downloading":
+            now = time.time()
+            if self._start_download_time == 0.0:
+                self._start_download_time = now
+
+            downloaded = int(d.get("downloaded_bytes") or 0)
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+
+            # 1. 百分比计算兼容：
+            # 优先按字节：若 total_bytes 或 total_bytes_estimate 存在，则用 (downloaded / total) * 100
+            if total and total > 0:
+                self._total_bytes = total
+                percent = (downloaded / total) * 100.0
+            else:
+                # DASH 分片兜底：若无 total_bytes，但存在 fragment_index 和 fragment_count
+                frag_index = d.get("fragment_index")
+                frag_count = d.get("fragment_count")
+                if frag_index is not None and frag_count and frag_count > 0:
+                    percent = (frag_index / frag_count) * 100.0
+                else:
+                    percent = getattr(self, "_last_percent", 0.0)
+
+            # 确保平滑单调递增，不抖动回退；未进入合并转码前最多显示 99.9%
+            percent = min(max(getattr(self, "_last_percent", 0.0), percent), 99.9)
+            self._last_percent = percent
+
+            # 2. 实时下载速度计算：
+            # 若 d.get('speed') 存在且 > 0 则直接采用；
+            # 若 d.get('speed') 为 None（分片下载常见情况），则使用本地平滑计时器：记录已下载字节数增量与时间差
+            speed = d.get("speed")
+            if speed is not None and speed > 0:
+                speed_mb = speed / 1_048_576.0
+                self._speed_ema_mb = speed_mb
+                self._last_calc_time = now
+                self._last_calc_bytes = downloaded
+            else:
+                if self._last_calc_time == 0.0:
+                    self._last_calc_time = now
+                    self._last_calc_bytes = downloaded
+                    speed_mb = self._speed_ema_mb
+                else:
+                    dt = now - self._last_calc_time
+                    if dt >= 0.25:  # 每 0.25 秒以上采样一次增量，平滑计算即时速率
+                        delta_bytes = max(0, downloaded - self._last_calc_bytes)
+                        instant_speed_mb = (delta_bytes / dt) / 1_048_576.0
+                        if self._speed_ema_mb == 0.0:
+                            self._speed_ema_mb = instant_speed_mb
+                        else:
+                            self._speed_ema_mb = 0.65 * self._speed_ema_mb + 0.35 * instant_speed_mb
+                        self._last_calc_time = now
+                        self._last_calc_bytes = downloaded
+                    speed_mb = self._speed_ema_mb
+
+            self._last_speed_mb = speed_mb
+
+            # 3. 剩余时间 (ETA)：优先使用 d.get('eta')；若无则通过剩余量与速率动态换算
+            eta = d.get("eta")
+            if eta is not None and eta >= 0:
+                m, s = divmod(int(eta), 60)
+                h, m = divmod(m, 60)
+                eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            else:
+                tot = self._total_bytes
+                if tot and tot > downloaded and speed_mb > 0.05:
+                    rem_mb = (tot - downloaded) / 1_048_576.0
+                    rem_sec = int(rem_mb / speed_mb)
+                    m, s = divmod(rem_sec, 60)
+                    h, m = divmod(m, 60)
+                    eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+                elif percent > 1.0 and (now - self._start_download_time) > 1.0:
+                    elapsed = now - self._start_download_time
+                    pct_per_sec = percent / elapsed
+                    if pct_per_sec > 0:
+                        rem_sec = int((100.0 - percent) / pct_per_sec)
+                        m, s = divmod(rem_sec, 60)
+                        h, m = divmod(m, 60)
+                        eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+                    else:
+                        eta_str = "--:--"
+                else:
+                    eta_str = "--:--"
+
+            speed_str = f"{speed_mb:.2f} MB/s"
+            # 传递标准结构字典至 UI 回调
+            self.on_progress({
+                "percent": percent,
+                "speed_str": speed_str,
+                "speed_mb": speed_mb,
+                "eta_str": eta_str,
+                "status": "downloading",
+            })
+            self.on_status(
+                f"下载中  {percent:.1f}%  |  {speed_str}  |  剩余 {eta_str}",
+                "info",
+            )
+
+        elif status == "finished":
+            self.on_progress({
+                "percent": 100.0,
+                "speed_str": "0.00 MB/s",
+                "speed_mb": 0.0,
+                "eta_str": "00:00",
+                "status": "merging",
+            })
+            self.on_status("正在合并/转码，请稍候…", "info")
+
+        elif status == "error":
+            self.on_status("下载出错", "error")
+
+    def _postprocessor_hook(self, d: dict):
+        """后处理阶段回调：记录生成的文件路径。"""
+        if d.get("status") == "finished":
+            fp = d.get("filepath") or d.get("info_dict", {}).get("filepath") or d.get("info_dict", {}).get("_filename")
+            if fp and os.path.exists(fp):
+                self.final_output_path = os.path.abspath(fp)
+
+
+# 兼容性别名
+VideoDownloader = DownloadTask
+

@@ -1,0 +1,21 @@
+# ==============================================================================
+# YouTube Downloader — 依赖清单
+# ==============================================================================
+
+# Core Desktop GUI
+customtkinter>=6.0.0
+darkdetect>=0.8.0
+Pillow>=10.0.0
+
+# Video Download & Parsing Engine
+yt-dlp>=2024.1.0
+yt-dlp-ejs>=0.8.0
+requests>=2.31.0
+websockets>=12.0
+mutagen>=1.47.0
+
+# Fallback Media Tools
+static-ffmpeg>=2.5
+
+# macOS App Packaging (Optional, for building macOS .app)
+pyinstaller>=6.0.0

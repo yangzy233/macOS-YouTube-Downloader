@@ -1,0 +1,68 @@
+# ==============================================================================
+# YouTube Downloader — .gitignore
+# ==============================================================================
+
+# ── 1. 隐私与本地用户配置 ──────────────────────────────────────
+cookies.txt
+*cookie*.txt
+*cookies*.txt
+settings.json
+.env
+.env.*
+*.secret
+
+# ── 2. 外部大体积二进制工具（请通过 brew 或 setup.sh 获取） ────────
+ffmpeg
+ffprobe
+aria2c
+bin/
+*.exe
+*.dll
+*.dylib
+*.so
+
+# ── 3. 打包构建产物与缓存 ────────────────────────────────────
+build/
+dist/
+*.spec
+*.app/
+*.dmg
+*.pkg
+
+# ── 4. Python 虚拟环境与字节码缓存 ────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+
+# ── 5. 本地下载目录与测试多媒体文件 ────────────────────────────
+downloads/
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.mp3
+*.part
+*.ytdl
+*.srt
+*.vtt
+
+# ── 6. macOS 系统临时与元数据文件 ────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ── 7. 测试与运行日志临时文件 ────────────────────────────────
+test_clean.png
+test_*.png
+*.log
