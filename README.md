@@ -16,10 +16,12 @@
 
 ## 📥 下载安装（推荐普通用户）
 
-如果您无需修改源码，可直接下载开箱即用的安装镜像：
+如果您**不需要**修改源码，可直接下载开箱即用的安装镜像：
 
-1. 前往 [Releases 发布页面](https://github.com/yangzy233/macOS-YouTube-Downloader/releases) 下载最新的 `YouTube下载器-macOS-arm64.dmg`；
-2. 双击打开 `.dmg` 磁盘映像，将左侧的 **YouTube 下载器** 图标拖拽入右侧的 **Applications**（应用程序）替身中；
+1. 前往 **[Releases 发布页面](https://github.com/yangzy233/macOS-YouTube-Downloader/releases/latest)** 下载匹配您 Mac 芯片架构的最新安装包：
+   - 🍏 **Apple Silicon 芯片**（M1 / M2 / M3 / M4 系列）：下载 **`YouTube下载器-macOS-arm64.dmg`**（原生运行，性能最佳）；
+   - 💻 **Intel 处理器芯片**（老款 Mac）：下载 **`YouTube下载器-macOS-intel.dmg`**（原生 x86_64 指令集编译）。
+2. 双击打开下载的 `.dmg` 磁盘映像，将左侧的 **YouTube 下载器** 图标拖拽入右侧的 **Applications**（应用程序）替身中即可完成安装。
 3. **首次打开安全提示**：由于软件采用本地代码签名，若首次启动出现 macOS 安全提示「无法打开，因为无法验证开发者」：
    - 请在访达的「应用程序」文件夹中找到 **YouTube 下载器**；
    - **按住 Control 键点击（或右键点击）** 图标，在弹出菜单中选择 **「打开」**；
