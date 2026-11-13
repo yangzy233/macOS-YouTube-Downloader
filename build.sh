@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — 将 YouTube 下载器打包为独立 macOS .app 应用程序
+# build.sh — 将 YouTube 下载器打包为独立 macOS .app 应用程序及 .dmg 磁盘映像
 # 用法：bash build.sh
 
 set -euo pipefail
@@ -15,11 +15,11 @@ cd "$SCRIPT_DIR"
 PYTHON=".venv/bin/python"
 
 echo "=================================================="
-echo "    YouTube 下载器 — macOS .app 独立打包脚本"
+echo "  YouTube 下载器 — macOS .app & .dmg 打包流水线"
 echo "=================================================="
 
-# ── 1. 检查虚拟环境与 PyInstaller ──────────────────────────────
-echo "[1/6] 检查虚拟环境与依赖…"
+# ── 1. 检查虚拟环境与打包工具 ──────────────────────────────────
+echo "[1/7] 检查虚拟环境与打包工具依赖…"
 if [ ! -f "$PYTHON" ]; then
     echo "[ERROR] 未找到虚拟环境，请先运行："
     echo "  bash setup.sh"
@@ -27,19 +27,26 @@ if [ ! -f "$PYTHON" ]; then
 fi
 
 UV="$HOME/.local/bin/uv"
-if ! "$PYTHON" -c "import PyInstaller" 2>/dev/null; then
-    echo "  -> 正在安装 PyInstaller…"
-    if command -v uv &>/dev/null || [ -x "$UV" ]; then
-        UV_CMD=$(command -v uv 2>/dev/null || echo "$UV")
-        "$UV_CMD" pip install pyinstaller --python "$PYTHON" --quiet
-    else
-        "$PYTHON" -m pip install pyinstaller --quiet
+ensure_pkg() {
+    local mod="$1"
+    local pkg="${2:-$1}"
+    if ! "$PYTHON" -c "import $mod" 2>/dev/null; then
+        echo "  -> 正在安装 $pkg…"
+        if command -v uv &>/dev/null || [ -x "$UV" ]; then
+            UV_CMD=$(command -v uv 2>/dev/null || echo "$UV")
+            "$UV_CMD" pip install "$pkg" --python "$PYTHON" --quiet
+        else
+            "$PYTHON" -m pip install "$pkg" --quiet
+        fi
     fi
-fi
-echo "  -> PyInstaller 准备就绪"
+}
+
+ensure_pkg "PyInstaller" "pyinstaller"
+ensure_pkg "dmgbuild" "dmgbuild"
+echo "  -> PyInstaller 与 dmgbuild 准备就绪"
 
 # ── 2. 图标检查与自动生成 (icon.png -> app.icns) ──────────────
-echo "[2/6] 检查与准备应用程序图标…"
+echo "[2/7] 检查与准备应用程序图标…"
 if [ ! -f "app.icns" ]; then
     if [ ! -f "icon.png" ]; then
         echo "  -> 未发现 icon.png，使用 Python PIL 自动生成默认应用图标…"
@@ -91,15 +98,15 @@ else
 fi
 
 # ── 3. 准备内置二进制权限 ──────────────────────────────────────
-echo "[3/6] 检查内置二进制工具（ffmpeg, ffprobe, aria2c）…"
+echo "[3/7] 检查内置二进制工具（ffmpeg, ffprobe, aria2c）…"
 chmod 755 ffmpeg ffprobe aria2c 2>/dev/null || true
 
 # ── 4. 清理旧构建目录 ──────────────────────────────────────────
-echo "[4/6] 清理旧构建缓存…"
+echo "[4/7] 清理旧构建缓存…"
 rm -rf build dist *.spec 2>/dev/null || true
 
 # ── 5. 执行 PyInstaller 打包 ──────────────────────────────────
-echo "[5/6] 执行 PyInstaller 打包为 macOS .app（预计需 1-2 分钟）…"
+echo "[5/7] 执行 PyInstaller 打包为 macOS .app（预计需 1-2 分钟）…"
 
 PYINSTALLER_ARGS=(
     --name "YouTube下载器"
@@ -125,7 +132,7 @@ fi
 "$PYTHON" -m PyInstaller "${PYINSTALLER_ARGS[@]}" main.py
 
 # ── 6. 完善 .app 结构、权限与本地化配置 ────────────────────────
-echo "[6/6] 配置 .app 本地化、执行权限与签名…"
+echo "[6/7] 配置 .app 本地化、执行权限与签名…"
 
 APP_PATH="dist/YouTube下载器.app"
 PLIST="$APP_PATH/Contents/Info.plist"
@@ -161,18 +168,33 @@ print('  -> 已成功配置 Info.plist 简体中文本地化')
         echo "  -> 正在应用 macOS 本地签名…"
         codesign --force --deep --sign - "$APP_PATH" 2>/dev/null || true
     fi
-
-    echo ""
-    echo "=================================================="
-    echo "  ✅ 打包成功！独立应用程序位于："
-    echo "  $SCRIPT_DIR/$APP_PATH"
-    echo "=================================================="
-    echo ""
-    echo "启动方式："
-    echo "  双击打开：在访达中双击 'dist/YouTube下载器.app'"
-    echo "  命令行：  open '$APP_PATH'"
-    echo ""
 else
     echo "[ERROR] 未在 dist 目录下找到 YouTube下载器.app"
+    exit 1
+fi
+
+# ── 7. 封装为 macOS 标准拖拽安装型 .dmg 磁盘映像 ────────────────
+echo "[7/7] 封装为拖拽安装型 .dmg 磁盘映像…"
+DMG_PATH="dist/YouTube下载器-macOS-arm64.dmg"
+rm -f "$DMG_PATH"
+
+echo "  -> 正在运行 dmgbuild 生成 .dmg 镜像…"
+"$PYTHON" -m dmgbuild -s dmg_settings.py "YouTube 下载器" "$DMG_PATH"
+
+if [ -f "$DMG_PATH" ]; then
+    DMG_SIZE=$(ls -lh "$DMG_PATH" | awk '{print $5}')
+    echo ""
+    echo "=================================================="
+    echo "  ✅ 全部打包成功！"
+    echo "  独立应用程序: $SCRIPT_DIR/$APP_PATH"
+    echo "  DMG 安装映像: $SCRIPT_DIR/$DMG_PATH ($DMG_SIZE)"
+    echo "=================================================="
+    echo ""
+    echo "启动与安装方式："
+    echo "  直接打开：open '$APP_PATH'"
+    echo "  挂载安装：open '$DMG_PATH'"
+    echo ""
+else
+    echo "[ERROR] 未能成功生成 .dmg 镜像"
     exit 1
 fi

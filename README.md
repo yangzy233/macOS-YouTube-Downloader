@@ -14,6 +14,19 @@
 
 ---
 
+## 📥 下载安装（推荐普通用户）
+
+如果您无需修改源码，可直接下载开箱即用的安装镜像：
+
+1. 前往 [Releases 发布页面](https://github.com/yangzy233/macOS-YouTube-Downloader/releases) 下载最新的 `YouTube下载器-macOS-arm64.dmg`；
+2. 双击打开 `.dmg` 磁盘映像，将左侧的 **YouTube 下载器** 图标拖拽入右侧的 **Applications**（应用程序）替身中；
+3. **首次打开安全提示**：由于软件采用本地代码签名，若首次启动出现 macOS 安全提示「无法打开，因为无法验证开发者」：
+   - 请在访达的「应用程序」文件夹中找到 **YouTube 下载器**；
+   - **按住 Control 键点击（或右键点击）** 图标，在弹出菜单中选择 **「打开」**；
+   - 在系统警告弹窗中再次点击 **「打开」**，之后即可永久双击直接运行。
+
+---
+
 ## 🌟 核心亮点与深度定制
 
 - 🍎 **原生 macOS 极简暗黑美学**
@@ -71,7 +84,7 @@ brew install ffmpeg
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/<your-username>/macOS-YouTube-Downloader.git
+git clone https://github.com/yangzy233/macOS-YouTube-Downloader.git
 cd macOS-YouTube-Downloader
 
 # 2. 一键配置虚拟环境并安装依赖
@@ -97,21 +110,20 @@ python main.py
 
 ---
 
-## 📦 打包为独立 macOS 桌面应用 (`.app`)
+## 📦 打包为独立应用与 .dmg 安装包
 
-项目提供了完备的 PyInstaller 自动化构建流水线：
+项目提供了完备的一键打包流水线（基于 PyInstaller + dmgbuild）：
 
 ```bash
 bash build.sh
 ```
 
-构建脚本将自动执行以下操作：
+构建脚本将自动执行以下全套流水线：
 1. 编译 1024×1024 高清图标资源并生成标准 `app.icns`；
 2. 打包集成可执行文件与资源，配置 `Info.plist` 简体中文多语言支持；
 3. 执行本地 Ad-hoc 代码签名，规避 macOS 启动拦截；
-4. 生成独立应用程序：`dist/YouTube下载器.app`。
-
-打包完成后，直接将 `dist/YouTube下载器.app` 拖入系统的 `/Applications`（应用程序）文件夹即可随时使用！
+4. 生成独立应用程序：`dist/YouTube下载器.app`；
+5. 自动封装为极简白底拖拽安装型磁盘映像：`dist/YouTube下载器-macOS-arm64.dmg`。
 
 ---
 
@@ -125,9 +137,10 @@ macOS-YouTube-Downloader/
 ├── config.py           # 用户配置管理与持久化模块 (~/.config/youtubedownloader/)
 ├── icon.png            # 1024x1024 高分辨率主图标源文件
 ├── app.icns            # macOS 标准图标资源包
+├── dmg_settings.py     # dmgbuild 磁盘映像布局与视觉配置文件
 ├── requirements.txt    # 核心 Python 依赖清单
 ├── setup.sh            # 自动化环境配置脚本
-├── build.sh            # macOS 独立应用打包脚本
+├── build.sh            # macOS 独立应用及 .dmg 打包流水线
 ├── LICENSE             # MIT 开源授权协议
 └── README.md           # 项目详细说明文档
 ```
