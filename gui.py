@@ -82,6 +82,11 @@ OUTPUT_FORMAT_OPTIONS = [
     "WebM (原始流)",
 ]
 
+OUTPUT_FORMAT_OPTIONS_HDR = [
+    "MKV (原画极速)",
+    "WebM (原始流)",
+]
+
 CHROME_EDGE_URL = "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
 FIREFOX_URL = "https://addons.mozilla.org/firefox/addon/get-cookies-txt-locally/"
 GITHUB_URL = "https://github.com/kairi003/Get-cookies.txt-LOCALLY"
@@ -1435,17 +1440,120 @@ class App(ctk.CTk):
     select_save_dir = _browse_dir
     browse_directory = _browse_dir
 
-    def _get_effective_quality_size(self, q: dict) -> tuple[int, str]:
-        """根据当前全局选中的输出封装格式计算该画质规格的真实预估体积。"""
+    def _get_effective_quality_size(self, q: dict, task: dict | None = None) -> tuple[int, str]:
+        """根据当前选中的输出封装格式计算该画质规格的真实预估体积。"""
         if not q:
             return 0, "--"
         raw_bytes = q.get("raw_size_bytes") or q.get("size_bytes") or 0
-        fmt = getattr(self, "output_format", "MP4 (苹果兼容)")
-        if "MP4" in fmt and q.get("needs_transcode"):
+
+        fmt = None
+        if task and isinstance(task, dict) and task.get("output_format"):
+            fmt = task.get("output_format")
+        elif len(self._parsed_tasks) == 1 and self._parsed_tasks[0].get("output_format"):
+            fmt = self._parsed_tasks[0].get("output_format")
+        if not fmt:
+            fmt = getattr(self, "output_format", "MP4 (苹果兼容)")
+
+        # HDR 模式下统一采用原画容器（MKV/WebM），不转码
+        is_hdr = bool(q.get("is_hdr")) or ("hdr" in str(q.get("label", "")).lower())
+        if is_hdr:
+            sz_bytes = raw_bytes
+        elif "MP4" in fmt and q.get("needs_transcode"):
             sz_bytes = q.get("transcode_size_bytes") or raw_bytes
         else:
             sz_bytes = raw_bytes
         return sz_bytes, format_size(sz_bytes)
+
+    def _sync_format_with_quality(self, task: dict | None = None):
+        """
+        根据画质规格（HDR 或 SDR）动态联动并同步【格式】下拉菜单：
+        1. 当选中画质为 HDR 时：
+           - 格式下拉菜单仅保留 ["MKV (原画极速)", "WebM (原始流)"]（移除 MP4）；
+           - 若当前格式为 MP4 或不在支持列表中，自动设为 "MKV (原画极速)"，标记 auto_switched_to_mkv。
+        2. 当选中画质为普通 SDR 时：
+           - 恢复完整列表 ["MP4 (苹果兼容)", "MKV (原画极速)", "WebM (原始流)"]；
+           - 若此前因 HDR 被自动切到了 MKV（且未手动指定其他格式），自动恢复为全局默认格式。
+        3. 同步刷新预估体积 Badge 与元数据。
+        """
+        if task is None:
+            if self._parsed_tasks:
+                task = self._parsed_tasks[0]
+            else:
+                return
+
+        q = task.get("selected_quality") or {}
+        is_hdr = bool(q.get("is_hdr")) or ("hdr" in str(q.get("label", "")).lower())
+
+        # 匹配该任务关联的格式下拉菜单
+        fmt_menu = task.get("format_menu_widget") or task.get("format_menu")
+        if fmt_menu is None:
+            if len(self._parsed_tasks) == 1 and hasattr(self, "_single_format_menu"):
+                fmt_menu = self._single_format_menu
+            elif hasattr(self, "_batch_format_menu"):
+                fmt_menu = self._batch_format_menu
+
+        cur_fmt = task.get("output_format") or getattr(self, "output_format", "MP4 (苹果兼容)")
+
+        if is_hdr:
+            # HDR 模式：仅保留原画容器（MKV 与 WebM），移除 MP4
+            if fmt_menu:
+                try:
+                    fmt_menu.configure(values=OUTPUT_FORMAT_OPTIONS_HDR)
+                except Exception:
+                    pass
+
+            if cur_fmt not in OUTPUT_FORMAT_OPTIONS_HDR or "MP4" in cur_fmt:
+                task["auto_switched_to_mkv"] = True
+                task["output_format"] = "MKV (原画极速)"
+                if fmt_menu:
+                    try:
+                        fmt_menu.set("MKV (原画极速)")
+                    except Exception:
+                        pass
+            else:
+                task["output_format"] = cur_fmt
+                if fmt_menu:
+                    try:
+                        fmt_menu.set(cur_fmt)
+                    except Exception:
+                        pass
+        else:
+            # 普通 SDR 模式：恢复完整选项
+            if fmt_menu:
+                try:
+                    fmt_menu.configure(values=OUTPUT_FORMAT_OPTIONS)
+                except Exception:
+                    pass
+
+            if task.get("auto_switched_to_mkv"):
+                task["auto_switched_to_mkv"] = False
+                default_fmt = getattr(self, "output_format", "MP4 (苹果兼容)")
+                task["output_format"] = default_fmt
+                if fmt_menu:
+                    try:
+                        fmt_menu.set(default_fmt)
+                    except Exception:
+                        pass
+            else:
+                task["output_format"] = cur_fmt
+                if fmt_menu:
+                    try:
+                        fmt_menu.set(cur_fmt)
+                    except Exception:
+                        pass
+
+        # 刷新单视频体积 Badge
+        if hasattr(self, "_size_badge"):
+            _, sz_str = self._get_effective_quality_size(q, task)
+            try:
+                self._size_badge.configure(text=sz_str)
+            except Exception:
+                pass
+
+        # 刷新多视频卡片体积
+        self._update_card_size(task)
+        if hasattr(self, "_batch_total_size_badge"):
+            self._update_total_size()
 
     def _on_format_change(self, new_format: str):
         """用户切换输出封装格式（MP4 / MKV / WebM）时，更新持久化配置并实时联动所有卡片预估体积。"""
@@ -1465,28 +1573,38 @@ class App(ctk.CTk):
 
         # 刷新单视频视图中的体积 badge
         if self._parsed_tasks:
-            cur_q = self._parsed_tasks[0].get("selected_quality") or (self._qualities[0] if self._qualities else {})
+            s_task = self._parsed_tasks[0]
+            s_task["output_format"] = new_format
+            s_task["auto_switched_to_mkv"] = False
+            cur_q = s_task.get("selected_quality") or (self._qualities[0] if self._qualities else {})
             if cur_q and hasattr(self, "_size_badge"):
-                _, sz_str = self._get_effective_quality_size(cur_q)
+                _, sz_str = self._get_effective_quality_size(cur_q, s_task)
                 self._size_badge.configure(text=sz_str)
 
         # 刷新多视频队列卡片中的体积 badge 与元数据
         for task in self.batch_tasks:
+            task["output_format"] = new_format
+            task["auto_switched_to_mkv"] = False
             self._update_card_size(task)
 
         if hasattr(self, "_batch_total_size_badge"):
             self._update_total_size()
 
     def _on_quality_change(self, selected_label: str):
-        """画质下拉框改变时，同步刷新右侧胶囊 Badge 的预估体积。"""
+        """画质下拉框改变时，同步刷新格式联动与右侧胶囊 Badge 的预估体积。"""
         if not self._qualities:
             return
         q = next((item for item in self._qualities if item.get("label") == selected_label), None)
         if q:
-            _, sz_str = self._get_effective_quality_size(q)
-            self._size_badge.configure(text=sz_str)
             if self._parsed_tasks:
-                self._parsed_tasks[0]["selected_quality"] = q
+                task = self._parsed_tasks[0]
+                task["custom_quality"] = True
+                task["selected_quality"] = q
+                task["prefer_hdr"] = bool(q.get("is_hdr", False)) or ("hdr" in str(q.get("label", "")).lower())
+                self._sync_format_with_quality(task)
+            else:
+                _, sz_str = self._get_effective_quality_size(q)
+                self._size_badge.configure(text=sz_str)
 
     def _find_matching_quality(self, quality_options: list[dict], global_preset: str, prefer_hdr: bool = False) -> dict:
         """在该视频的可选列表中寻找最接近全局预设的画质。"""
@@ -1495,7 +1613,7 @@ class App(ctk.CTk):
     def _update_card_size(self, task: dict):
         """刷新指定任务卡片上的预估体积 Badge 与元数据标签。"""
         q = task.get("selected_quality") or {}
-        _, sz_str = self._get_effective_quality_size(q)
+        _, sz_str = self._get_effective_quality_size(q, task)
         if task.get("size_badge"):
             try:
                 task["size_badge"].configure(text=sz_str)
@@ -1512,7 +1630,7 @@ class App(ctk.CTk):
 
     def _update_total_size(self):
         """重新汇总并刷新顶部的【预估总计】体积数值。"""
-        total_bytes = sum(self._get_effective_quality_size(t.get("selected_quality") or {})[0] for t in self._parsed_tasks)
+        total_bytes = sum(self._get_effective_quality_size(t.get("selected_quality") or {}, t)[0] for t in self._parsed_tasks)
         self._batch_total_size_badge.configure(text=f"预估总计: {format_size(total_bytes)}")
 
     def _on_toggle_hdr_checkbox(self):
@@ -1563,7 +1681,7 @@ class App(ctk.CTk):
                                 task["menu_widget"].set(cand["label"])
                             except Exception:
                                 pass
-                        self._update_card_size(task)
+                        self._sync_format_with_quality(task)
 
             # 2. 如果未被用户单独修改过 (custom_quality == False)，按全局预设与新 HDR 状态自适应挑选
             else:
@@ -1576,7 +1694,7 @@ class App(ctk.CTk):
                             task["menu_widget"].set(target_q["label"])
                         except Exception:
                             pass
-                    self._update_card_size(task)
+                    self._sync_format_with_quality(task)
 
         # 单视频视图联动同步
         if getattr(self, "_current_task_view", "batch") == "single" and self._parsed_tasks:
@@ -1597,12 +1715,20 @@ class App(ctk.CTk):
                             self._quality_menu.set(s_cand["label"])
                         except Exception:
                             pass
-                    try:
-                        self._size_badge.configure(text=self._get_effective_quality_size(s_cand)[1])
-                    except Exception:
-                        pass
+                    self._sync_format_with_quality(s_task)
 
-        # 3. 汇总刷新顶部的【预估总计】标签
+        # 3. 批量控制栏格式下拉框同步联动
+        if hasattr(self, "_batch_format_menu"):
+            if is_hdr_enabled:
+                self._batch_format_menu.configure(values=OUTPUT_FORMAT_OPTIONS_HDR)
+                if "MP4" in self._batch_format_menu.get():
+                    self._batch_format_menu.set("MKV (原画极速)")
+            else:
+                self._batch_format_menu.configure(values=OUTPUT_FORMAT_OPTIONS)
+                if self._batch_format_menu.get() not in OUTPUT_FORMAT_OPTIONS:
+                    self._batch_format_menu.set(self.output_format)
+
+        # 4. 汇总刷新顶部的【预估总计】标签
         self._update_total_size()
 
     _on_hdr_toggle = _on_toggle_hdr_checkbox
@@ -1720,25 +1846,40 @@ class App(ctk.CTk):
                         task["menu_widget"].set(target_q["label"])
                     except Exception:
                         pass
-                self._update_card_size(task)
+                self._sync_format_with_quality(task)
+
+        # 单视频视图同步
+        if getattr(self, "_current_task_view", "batch") == "single" and self._parsed_tasks:
+            s_task = self._parsed_tasks[0]
+            if not s_task.get("custom_quality", False):
+                opts = s_task.get("quality_options") or s_task.get("qualities") or []
+                target_q = self._find_matching_quality(opts, preset_name, prefer_hdr=prefer_hdr)
+                if target_q:
+                    s_task["selected_quality"] = target_q
+                    s_task["prefer_hdr"] = prefer_hdr
+                    if hasattr(self, "_quality_menu") and target_q.get("label"):
+                        try:
+                            self._quality_menu.set(target_q["label"])
+                        except Exception:
+                            pass
+                    self._sync_format_with_quality(s_task)
 
         self._update_total_size()
 
     def _on_card_quality_change(self, selected_label: str, task: dict):
-        """用户在卡片内手动切换下拉选项时，标记 custom_quality 并刷新体积与总计。"""
+        """用户在卡片内手动切换下拉选项时，标记 custom_quality 并刷新体积与格式联动。"""
         task["custom_quality"] = True
         opts = task.get("quality_options") or task.get("qualities") or []
         matching_q = next((q for q in opts if q.get("label") == selected_label), None)
         if matching_q:
             task["selected_quality"] = matching_q
-            task["prefer_hdr"] = bool(matching_q.get("is_hdr", False))
+            task["prefer_hdr"] = bool(matching_q.get("is_hdr", False)) or ("hdr" in str(matching_q.get("label", "")).lower())
             if task.get("menu_widget"):
                 try:
                     task["menu_widget"].set(selected_label)
                 except Exception:
                     pass
-            self._update_card_size(task)
-        self._update_total_size()
+            self._sync_format_with_quality(task)
 
     def _delete_queue_item(self, target_task: dict):
         """从任务队列中剔除指定视频，销毁对应卡片并重排序号与总大小。"""
@@ -1909,7 +2050,11 @@ class App(ctk.CTk):
                 default_q = info.get("selected_quality") or self._qualities[0]
                 default_lbl = default_q.get("label", labels[0])
                 self._quality_menu.set(default_lbl)
-                self._size_badge.configure(text=self._get_effective_quality_size(default_q)[1])
+                info["selected_quality"] = default_q
+                info["format_menu"] = self._single_format_menu
+
+                # 动态联动格式与体积 Badge
+                self._sync_format_with_quality(info)
 
                 # 动态填充单视频字幕下拉菜单
                 subs = info.get("available_subtitles") or [{"code": "none", "name": "无字幕"}]
@@ -1930,6 +2075,8 @@ class App(ctk.CTk):
 
         # 多视频队列视图展示
         else:
+            for task_info in self._parsed_tasks:
+                self._sync_format_with_quality(task_info)
             self._render_batch_queue()
             self._download_btn.configure(state="normal", text=f"开始下载队列 (共 {success_count} 个)")
             if fail_count > 0:
@@ -1989,7 +2136,7 @@ class App(ctk.CTk):
         total_bytes = 0
         for idx, task_info in enumerate(self._parsed_tasks):
             sel_q = task_info.get("selected_quality") or {}
-            q_bytes, q_sz_str = self._get_effective_quality_size(sel_q)
+            q_bytes, q_sz_str = self._get_effective_quality_size(sel_q, task_info)
             total_bytes += q_bytes
 
             row = ctk.CTkFrame(
@@ -2288,7 +2435,7 @@ class App(ctk.CTk):
                 enable_hdr=is_hdr,
                 enable_subtitles=enable_sub,
                 subtitle_lang=sub_code,
-                output_format=getattr(self, "output_format", "MP4 (苹果兼容)"),
+                output_format=task_info.get("output_format") or getattr(self, "output_format", "MP4 (苹果兼容)"),
             )
             self._download_task = task
             task.start()
@@ -2344,7 +2491,7 @@ class App(ctk.CTk):
                 enable_hdr=prefer_hdr,
                 enable_subtitles=enable_sub,
                 subtitle_lang=sub_code,
-                output_format=getattr(self, "output_format", "MP4 (苹果兼容)"),
+                output_format=task_info.get("output_format") or getattr(self, "output_format", "MP4 (苹果兼容)"),
             )
             self._download_task = task
             task.start()
