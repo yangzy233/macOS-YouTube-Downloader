@@ -1127,6 +1127,8 @@ class DownloadTask:
         self.on_error = on_error
         self.enable_hdr = enable_hdr
         self.subtitle_lang = subtitle_lang
+        if not output_format and isinstance(quality, dict) and quality.get("output_format"):
+            output_format = quality.get("output_format")
         self.output_format = output_format or "MP4 (苹果兼容)"
         if subtitle_lang is not None:
             self.enable_subtitles = bool(subtitle_lang != "none" and subtitle_lang)
