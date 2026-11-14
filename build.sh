@@ -43,6 +43,7 @@ ensure_pkg() {
 
 ensure_pkg "PyInstaller" "pyinstaller"
 ensure_pkg "dmgbuild" "dmgbuild"
+ensure_pkg "mutagen" "mutagen"
 echo "  -> PyInstaller 与 dmgbuild 准备就绪"
 
 # ── 2. 图标检查与自动生成 (icon.png -> app.icns) ──────────────
@@ -103,7 +104,8 @@ chmod 755 ffmpeg ffprobe aria2c 2>/dev/null || true
 
 # ── 4. 清理旧构建目录 ──────────────────────────────────────────
 echo "[4/7] 清理旧构建缓存…"
-rm -rf build dist *.spec 2>/dev/null || true
+mkdir -p dist
+rm -rf build "dist/YouTube下载器.app" "dist/YouTube下载器-macOS-arm64.dmg" *.spec 2>/dev/null || true
 
 # ── 5. 执行 PyInstaller 打包 ──────────────────────────────────
 echo "[5/7] 执行 PyInstaller 打包为 macOS .app（预计需 1-2 分钟）…"
@@ -120,6 +122,7 @@ PYINSTALLER_ARGS=(
     --collect-all customtkinter
     --collect-all yt_dlp
     --collect-all yt_dlp_ejs
+    --collect-all mutagen
     --hidden-import PIL
     --hidden-import static_ffmpeg
 )

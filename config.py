@@ -12,6 +12,7 @@ DEFAULT_SETTINGS = {
     "enable_subtitles": False,    # 兼容老版
     "default_subtitle": "优先简体中文",  # 默认字幕策略: 无字幕 / 优先简体中文 / 优先英文 / 下载全部字幕
     "prefer_hdr": False,          # 默认普通 SDR (MP4)
+    "output_format": "MP4 (苹果兼容)",  # 默认输出封装格式: MP4 (苹果兼容) / MKV (原画极速) / WebM (原始流)
 }
 
 # 应用内部独立托管的专属 Cookie 持久化存储路径

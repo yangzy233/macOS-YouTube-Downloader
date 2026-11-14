@@ -35,9 +35,13 @@
   - 基于 CustomTkinter 打造，遵循 Apple Human Interface Guidelines (HIG) 设计规范。
   - 精准支持深色/浅色自适应外观，采用原生质感卡片、半透明层级与高对比度操作指示。
 - ⚡ **HDR / SDR 智能双轨混流与转码封装**
-  - **SDR 模式**：严格锁定 H.264 (`avc1`) 视频流 + 原生 AAC (`mp4a`) 音频流，直接封装为标准 MP4，**彻底杜绝 VP9 编码，完美兼容 macOS 原生 QuickTime 与访达空格键预览**。
+  - **SDR 模式**：1080p 及以下严格锁定原生 H.264 (`avc1`) 视频流 + AAC (`mp4a`) 音频流，直接封装为标准 MP4；2K/4K 支持 Apple Silicon 硬件加速高能效转码，**彻底杜绝 VP9 无法兼容问题，macOS 原生 QuickTime 秒开播放**。
   - **HDR 模式**：智能嗅探 HDR10 / 杜比视界高动态范围视频流，自动封装为 MKV 容器，呈现沉浸式画质细节。
   - **纯音频模式**：支持一键提取 192kbps / 320kbps 高品质 MP3 或原生 M4A，自动内嵌歌曲海报与元数据。
+- 🎬 **三种输出封装格式自由切换**
+  - **MP4 (苹果兼容)**：默认推荐，QuickTime 兼容最佳；2K/4K 启用 VideoToolbox 硬件转码 (`hvc1`)，码率精准优化（2K 7.5Mbps / 4K 15Mbps），杜绝体积膨胀与速度缓慢。
+  - **MKV (原画极速)**：不进行任何二次转码，通过 `-c copy` 实现 1~2 秒无损极速合流，完整保留原始高码率音视频流。
+  - **WebM (原始流)**：下载 YouTube 原始 WebM 流（VP9/AV1 + Opus），体积轻巧无损。
 - 🎯 **全局画质与单视频卡片独立联动**
   - 支持多视频批量解析，自动嗅探各清晰度选项与预估体积胶囊 Badge。
   - 顶部一键统一切换全局画质（4K / 2K / 1080P / 720P / 音频），单卡片可自由独立覆盖设定。
@@ -117,15 +121,19 @@ python main.py
 项目提供了完备的一键打包流水线（基于 PyInstaller + dmgbuild）：
 
 ```bash
+# 🍏 构建 Apple Silicon 架构 (arm64) 安装包：
 bash build.sh
+
+# 💻 构建 Intel 架构 (x86_64) 安装包：
+bash build_intel.sh
 ```
 
 构建脚本将自动执行以下全套流水线：
 1. 编译 1024×1024 高清图标资源并生成标准 `app.icns`；
-2. 打包集成可执行文件与资源，配置 `Info.plist` 简体中文多语言支持；
+2. 打包集成可执行文件与内置二进制工具，配置 `Info.plist` 简体中文多语言支持；
 3. 执行本地 Ad-hoc 代码签名，规避 macOS 启动拦截；
 4. 生成独立应用程序：`dist/YouTube下载器.app`；
-5. 自动封装为极简白底拖拽安装型磁盘映像：`dist/YouTube下载器-macOS-arm64.dmg`。
+5. 自动封装为极简白底拖拽安装型磁盘映像：`dist/YouTube下载器-macOS-arm64.dmg` / `dist/YouTube下载器-macOS-intel.dmg`。
 
 ---
 
@@ -142,7 +150,8 @@ macOS-YouTube-Downloader/
 ├── dmg_settings.py     # dmgbuild 磁盘映像布局与视觉配置文件
 ├── requirements.txt    # 核心 Python 依赖清单
 ├── setup.sh            # 自动化环境配置脚本
-├── build.sh            # macOS 独立应用及 .dmg 打包流水线
+├── build.sh            # macOS arm64 独立应用及 .dmg 打包流水线
+├── build_intel.sh      # macOS x86_64 (Intel) 独立应用及 .dmg 打包流水线
 ├── LICENSE             # MIT 开源授权协议
 └── README.md           # 项目详细说明文档
 ```

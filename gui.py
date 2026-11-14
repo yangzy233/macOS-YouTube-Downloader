@@ -76,6 +76,12 @@ GLOBAL_SUBTITLE_OPTIONS = [
     "下载全部字幕",
 ]
 
+OUTPUT_FORMAT_OPTIONS = [
+    "MP4 (苹果兼容)",
+    "MKV (原画极速)",
+    "WebM (原始流)",
+]
+
 CHROME_EDGE_URL = "https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
 FIREFOX_URL = "https://addons.mozilla.org/firefox/addon/get-cookies-txt-locally/"
 GITHUB_URL = "https://github.com/kairi003/Get-cookies.txt-LOCALLY"
@@ -177,6 +183,9 @@ class App(ctk.CTk):
             self.default_subtitle = "优先简体中文"
         self.enable_subtitles = bool(self.default_subtitle != "无字幕")
         self.prefer_hdr = bool(self._settings.get("prefer_hdr", False))
+        self.output_format = str(self._settings.get("output_format") or "MP4 (苹果兼容)")
+        if self.output_format not in OUTPUT_FORMAT_OPTIONS:
+            self.output_format = "MP4 (苹果兼容)"
 
         self.notify_var = ctk.BooleanVar(value=self.enable_notification)
         self.hdr_var = ctk.BooleanVar(value=self.prefer_hdr)
@@ -225,6 +234,7 @@ class App(ctk.CTk):
             "enable_subtitles": getattr(self, "enable_subtitles", False),
             "default_subtitle": getattr(self, "default_subtitle", "优先简体中文"),
             "prefer_hdr": getattr(self, "prefer_hdr", False),
+            "output_format": getattr(self, "output_format", "MP4 (苹果兼容)"),
         }
         save_settings(cfg)
 
@@ -464,7 +474,7 @@ class App(ctk.CTk):
             quality_row,
             values=["等待解析..."],
             command=self._on_quality_change,
-            width=260,
+            width=210,
             height=32,
             corner_radius=8,
             fg_color=COLOR_INPUT_BG,
@@ -473,33 +483,33 @@ class App(ctk.CTk):
             text_color=COLOR_TEXT_PRIMARY,
             font=ctk.CTkFont(size=12),
         )
-        self._quality_menu.grid(row=0, column=1, sticky="w", padx=(0, 10))
+        self._quality_menu.grid(row=0, column=1, sticky="w", padx=(0, 8))
 
         # 需求 1：macOS 风格灰色胶囊 Badge（背景 #2C2C2E，圆角 6）
         self._size_badge = ctk.CTkLabel(
             quality_row,
             text="--",
-            width=76,
+            width=70,
             height=26,
             corner_radius=6,
             fg_color=COLOR_BADGE_BG,
             text_color=COLOR_BADGE_TEXT,
             font=ctk.CTkFont(size=11, weight="bold"),
         )
-        self._size_badge.grid(row=0, column=2, sticky="w")
+        self._size_badge.grid(row=0, column=2, sticky="w", padx=(0, 8))
 
         ctk.CTkLabel(
             quality_row,
-            text="字幕：",
+            text="格式：",
             font=ctk.CTkFont(size=12),
             text_color=COLOR_TEXT_PRIMARY,
-        ).grid(row=0, column=3, padx=(12, 4), sticky="w")
+        ).grid(row=0, column=3, sticky="w", padx=(0, 2))
 
-        self._single_subtitle_menu = ctk.CTkOptionMenu(
+        self._single_format_menu = ctk.CTkOptionMenu(
             quality_row,
-            values=["无字幕"],
-            command=self._on_single_subtitle_change,
-            width=110,
+            values=OUTPUT_FORMAT_OPTIONS,
+            command=self._on_format_change,
+            width=115,
             height=28,
             corner_radius=6,
             fg_color=COLOR_INPUT_BG,
@@ -508,7 +518,30 @@ class App(ctk.CTk):
             text_color=COLOR_TEXT_PRIMARY,
             font=ctk.CTkFont(size=12),
         )
-        self._single_subtitle_menu.grid(row=0, column=4, sticky="w", padx=(0, 10))
+        self._single_format_menu.grid(row=0, column=4, sticky="w", padx=(0, 8))
+        self._single_format_menu.set(self.output_format)
+
+        ctk.CTkLabel(
+            quality_row,
+            text="字幕：",
+            font=ctk.CTkFont(size=12),
+            text_color=COLOR_TEXT_PRIMARY,
+        ).grid(row=0, column=5, padx=(0, 2), sticky="w")
+
+        self._single_subtitle_menu = ctk.CTkOptionMenu(
+            quality_row,
+            values=["无字幕"],
+            command=self._on_single_subtitle_change,
+            width=100,
+            height=28,
+            corner_radius=6,
+            fg_color=COLOR_INPUT_BG,
+            button_color=COLOR_PRIMARY,
+            button_hover_color=COLOR_PRIMARY_HOVER,
+            text_color=COLOR_TEXT_PRIMARY,
+            font=ctk.CTkFont(size=12),
+        )
+        self._single_subtitle_menu.grid(row=0, column=6, sticky="w", padx=(0, 8))
 
         self._single_notify_checkbox = ctk.CTkCheckBox(
             quality_row,
@@ -524,7 +557,7 @@ class App(ctk.CTk):
             checkbox_height=16,
             corner_radius=4,
         )
-        self._single_notify_checkbox.grid(row=0, column=5, padx=(4, 0), sticky="w")
+        self._single_notify_checkbox.grid(row=0, column=7, padx=(2, 0), sticky="w")
 
         # 视图 3：多视频批量队列展示视图
         self._batch_view = ctk.CTkFrame(self._task_card, fg_color="transparent")
@@ -546,27 +579,27 @@ class App(ctk.CTk):
         self._batch_total_size_badge = ctk.CTkLabel(
             batch_header,
             text="预估总计: --",
-            width=100,
+            width=90,
             height=26,
             corner_radius=6,
             fg_color=COLOR_BADGE_BG,
             text_color=COLOR_BADGE_TEXT,
             font=ctk.CTkFont(size=11, weight="bold"),
         )
-        self._batch_total_size_badge.grid(row=0, column=1, padx=(0, 10))
+        self._batch_total_size_badge.grid(row=0, column=1, padx=(0, 6))
 
         ctk.CTkLabel(
             batch_header,
-            text="全局画质：",
+            text="画质：",
             font=ctk.CTkFont(size=12),
             text_color=COLOR_TEXT_SECONDARY,
-        ).grid(row=0, column=2, padx=(0, 4))
+        ).grid(row=0, column=2, padx=(0, 2))
 
         self._batch_preset_menu = ctk.CTkOptionMenu(
             batch_header,
             values=BATCH_PRESET_OPTIONS,
             command=self._on_batch_preset_change,
-            width=115,
+            width=100,
             height=28,
             corner_radius=6,
             fg_color=COLOR_INPUT_BG,
@@ -577,6 +610,29 @@ class App(ctk.CTk):
         )
         self._batch_preset_menu.grid(row=0, column=3)
         self._batch_preset_menu.set("最高画质")
+
+        ctk.CTkLabel(
+            batch_header,
+            text="格式：",
+            font=ctk.CTkFont(size=12),
+            text_color=COLOR_TEXT_SECONDARY,
+        ).grid(row=0, column=4, padx=(6, 2))
+
+        self._batch_format_menu = ctk.CTkOptionMenu(
+            batch_header,
+            values=OUTPUT_FORMAT_OPTIONS,
+            command=self._on_format_change,
+            width=115,
+            height=28,
+            corner_radius=6,
+            fg_color=COLOR_INPUT_BG,
+            button_color=COLOR_PRIMARY,
+            button_hover_color=COLOR_PRIMARY_HOVER,
+            text_color=COLOR_TEXT_PRIMARY,
+            font=ctk.CTkFont(size=12),
+        )
+        self._batch_format_menu.grid(row=0, column=5)
+        self._batch_format_menu.set(self.output_format)
 
         self._hdr_checkbox = ctk.CTkCheckBox(
             batch_header,
@@ -592,20 +648,20 @@ class App(ctk.CTk):
             checkbox_height=16,
             corner_radius=4,
         )
-        self._hdr_checkbox.grid(row=0, column=4, padx=(8, 0))
+        self._hdr_checkbox.grid(row=0, column=6, padx=(6, 0))
 
         ctk.CTkLabel(
             batch_header,
             text="字幕：",
             font=ctk.CTkFont(size=12),
             text_color=COLOR_TEXT_SECONDARY,
-        ).grid(row=0, column=5, padx=(6, 2))
+        ).grid(row=0, column=7, padx=(6, 2))
 
         self._batch_subtitle_menu = ctk.CTkOptionMenu(
             batch_header,
             values=GLOBAL_SUBTITLE_OPTIONS,
             command=self._on_batch_subtitle_preset_change,
-            width=115,
+            width=100,
             height=28,
             corner_radius=6,
             fg_color=COLOR_INPUT_BG,
@@ -614,12 +670,12 @@ class App(ctk.CTk):
             text_color=COLOR_TEXT_PRIMARY,
             font=ctk.CTkFont(size=12),
         )
-        self._batch_subtitle_menu.grid(row=0, column=6)
+        self._batch_subtitle_menu.grid(row=0, column=8)
         self._batch_subtitle_menu.set(self.default_subtitle)
 
         self._notify_checkbox = ctk.CTkCheckBox(
             batch_header,
-            text="完成通知",
+            text="通知",
             variable=self.notify_var,
             command=self._on_notify_toggle,
             fg_color="#007AFF",
@@ -631,7 +687,7 @@ class App(ctk.CTk):
             checkbox_height=16,
             corner_radius=4,
         )
-        self._notify_checkbox.grid(row=0, column=7, padx=(8, 0))
+        self._notify_checkbox.grid(row=0, column=9, padx=(6, 0))
 
         # 队列滚动列表
         self._queue_scroll = ctk.CTkScrollableFrame(
@@ -1379,13 +1435,56 @@ class App(ctk.CTk):
     select_save_dir = _browse_dir
     browse_directory = _browse_dir
 
+    def _get_effective_quality_size(self, q: dict) -> tuple[int, str]:
+        """根据当前全局选中的输出封装格式计算该画质规格的真实预估体积。"""
+        if not q:
+            return 0, "--"
+        raw_bytes = q.get("raw_size_bytes") or q.get("size_bytes") or 0
+        fmt = getattr(self, "output_format", "MP4 (苹果兼容)")
+        if "MP4" in fmt and q.get("needs_transcode"):
+            sz_bytes = q.get("transcode_size_bytes") or raw_bytes
+        else:
+            sz_bytes = raw_bytes
+        return sz_bytes, format_size(sz_bytes)
+
+    def _on_format_change(self, new_format: str):
+        """用户切换输出封装格式（MP4 / MKV / WebM）时，更新持久化配置并实时联动所有卡片预估体积。"""
+        self.output_format = new_format
+        update_setting("output_format", new_format)
+
+        if hasattr(self, "_batch_format_menu"):
+            try:
+                self._batch_format_menu.set(new_format)
+            except Exception:
+                pass
+        if hasattr(self, "_single_format_menu"):
+            try:
+                self._single_format_menu.set(new_format)
+            except Exception:
+                pass
+
+        # 刷新单视频视图中的体积 badge
+        if self._parsed_tasks:
+            cur_q = self._parsed_tasks[0].get("selected_quality") or (self._qualities[0] if self._qualities else {})
+            if cur_q and hasattr(self, "_size_badge"):
+                _, sz_str = self._get_effective_quality_size(cur_q)
+                self._size_badge.configure(text=sz_str)
+
+        # 刷新多视频队列卡片中的体积 badge 与元数据
+        for task in self.batch_tasks:
+            self._update_card_size(task)
+
+        if hasattr(self, "_batch_total_size_badge"):
+            self._update_total_size()
+
     def _on_quality_change(self, selected_label: str):
         """画质下拉框改变时，同步刷新右侧胶囊 Badge 的预估体积。"""
         if not self._qualities:
             return
         q = next((item for item in self._qualities if item.get("label") == selected_label), None)
         if q:
-            self._size_badge.configure(text=q.get("size_str", "--"))
+            _, sz_str = self._get_effective_quality_size(q)
+            self._size_badge.configure(text=sz_str)
             if self._parsed_tasks:
                 self._parsed_tasks[0]["selected_quality"] = q
 
@@ -1396,7 +1495,7 @@ class App(ctk.CTk):
     def _update_card_size(self, task: dict):
         """刷新指定任务卡片上的预估体积 Badge 与元数据标签。"""
         q = task.get("selected_quality") or {}
-        sz_str = q.get("size_str", "--")
+        _, sz_str = self._get_effective_quality_size(q)
         if task.get("size_badge"):
             try:
                 task["size_badge"].configure(text=sz_str)
@@ -1413,7 +1512,7 @@ class App(ctk.CTk):
 
     def _update_total_size(self):
         """重新汇总并刷新顶部的【预估总计】体积数值。"""
-        total_bytes = sum(int((t.get("selected_quality") or {}).get("size_bytes", 0) or 0) for t in self._parsed_tasks)
+        total_bytes = sum(self._get_effective_quality_size(t.get("selected_quality") or {})[0] for t in self._parsed_tasks)
         self._batch_total_size_badge.configure(text=f"预估总计: {format_size(total_bytes)}")
 
     def _on_toggle_hdr_checkbox(self):
@@ -1499,7 +1598,7 @@ class App(ctk.CTk):
                         except Exception:
                             pass
                     try:
-                        self._size_badge.configure(text=s_cand.get("size_str", "--"))
+                        self._size_badge.configure(text=self._get_effective_quality_size(s_cand)[1])
                     except Exception:
                         pass
 
@@ -1810,7 +1909,7 @@ class App(ctk.CTk):
                 default_q = info.get("selected_quality") or self._qualities[0]
                 default_lbl = default_q.get("label", labels[0])
                 self._quality_menu.set(default_lbl)
-                self._size_badge.configure(text=default_q.get("size_str", "--"))
+                self._size_badge.configure(text=self._get_effective_quality_size(default_q)[1])
 
                 # 动态填充单视频字幕下拉菜单
                 subs = info.get("available_subtitles") or [{"code": "none", "name": "无字幕"}]
@@ -1890,7 +1989,8 @@ class App(ctk.CTk):
         total_bytes = 0
         for idx, task_info in enumerate(self._parsed_tasks):
             sel_q = task_info.get("selected_quality") or {}
-            total_bytes += int(sel_q.get("size_bytes", 0) or 0)
+            q_bytes, q_sz_str = self._get_effective_quality_size(sel_q)
+            total_bytes += q_bytes
 
             row = ctk.CTkFrame(
                 self._queue_scroll,
@@ -1997,7 +2097,7 @@ class App(ctk.CTk):
             # Column 4: 【预估体积胶囊 Badge】
             sz_badge = ctk.CTkLabel(
                 row,
-                text=sel_q.get("size_str", "--"),
+                text=q_sz_str,
                 width=62,
                 height=24,
                 corner_radius=5,
@@ -2188,6 +2288,7 @@ class App(ctk.CTk):
                 enable_hdr=is_hdr,
                 enable_subtitles=enable_sub,
                 subtitle_lang=sub_code,
+                output_format=getattr(self, "output_format", "MP4 (苹果兼容)"),
             )
             self._download_task = task
             task.start()
@@ -2243,6 +2344,7 @@ class App(ctk.CTk):
                 enable_hdr=prefer_hdr,
                 enable_subtitles=enable_sub,
                 subtitle_lang=sub_code,
+                output_format=getattr(self, "output_format", "MP4 (苹果兼容)"),
             )
             self._download_task = task
             task.start()

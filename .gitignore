@@ -16,6 +16,7 @@ ffmpeg
 ffprobe
 aria2c
 bin/
+bin_intel/
 *.exe
 *.dll
 *.dylib
@@ -23,14 +24,16 @@ bin/
 
 # ── 3. 打包构建产物与缓存 ────────────────────────────────────
 build/
+build_intel/
 dist/
+dist_intel/
 *.spec
 *.app/
 *.dmg
 *.pkg
 
 # ── 4. Python 虚拟环境与字节码缓存 ────────────────────────────
-.venv/
+.venv*/
 venv/
 env/
 ENV/
