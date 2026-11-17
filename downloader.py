@@ -115,7 +115,7 @@ NODE_LOCATION: str | None = _resolve_node()
 
 
 # ──────────────────────────────────────────────────────────────
-# aria2c 路径初始化（用于 16 线程极速并发拉流）
+# aria2c 路径初始化与高性能并发下载器 (LiveAria2cFD)
 # 优先使用包内或项目目录下的原生 macOS arm64 静态 aria2c 单文件
 # ──────────────────────────────────────────────────────────────
 def _resolve_aria2c() -> str | None:
@@ -123,6 +123,154 @@ def _resolve_aria2c() -> str | None:
 
 
 ARIA2C_LOCATION: str | None = _resolve_aria2c()
+
+
+def find_js_runtime() -> tuple[str, str] | tuple[None, None]:
+    """
+    智能探测宿主机或包内的可用 JavaScript 运行时（用于解密 YouTube n-challenge 彻底突破限速）。
+    按优先级探测 node、deno、bun、quickjs。
+    """
+    candidates = [
+        ("node", NODE_LOCATION),
+        ("node", "/usr/local/bin/node"),
+        ("node", "/opt/homebrew/bin/node"),
+        ("node", shutil.which("node")),
+        ("deno", "/usr/local/bin/deno"),
+        ("deno", "/opt/homebrew/bin/deno"),
+        ("deno", shutil.which("deno")),
+        ("bun", os.path.expanduser("~/.bun/bin/bun")),
+        ("bun", shutil.which("bun")),
+        ("quickjs", "/usr/local/bin/qjs"),
+        ("quickjs", shutil.which("qjs")),
+    ]
+    for rtype, path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return rtype, str(path)
+    return None, None
+
+
+ARIA2_PROG_REGEX = re.compile(
+    r"\[#\w+\s+([\d\.]+\w+)/([\d\.]+\w+)\((\d+)%\)\s+CN:(\d+)\s+DL:([\d\.]+\w+)(?:\s+ETA:([\w\d]+))?\]"
+)
+
+
+def parse_readable_bytes(s: str) -> int:
+    """解析 aria2 输出的人类可读体积字符串（如 '14.88MiB', '500KiB'）为整数字节数。"""
+    if not s:
+        return 0
+    m = re.match(r"^([\d\.]+)\s*([a-zA-Z]*)$", s.strip())
+    if not m:
+        return 0
+    val, unit = m.groups()
+    units = {
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
+    }
+    return int(float(val) * units.get(unit.lower(), 1))
+
+
+def parse_readable_eta(s: str) -> int:
+    """解析 aria2 输出的倒计时字符串（如 '8m27s', '20s', '1h20m'）为秒数。"""
+    if not s:
+        return 0
+    sec = 0
+    matches = re.findall(r"(\d+)([hms])", s.lower())
+    if not matches and s.isdigit():
+        return int(s)
+    for val, unit in matches:
+        if unit == "h":
+            sec += int(val) * 3600
+        elif unit == "m":
+            sec += int(val) * 60
+        elif unit == "s":
+            sec += int(val)
+    return sec
+
+
+try:
+    from yt_dlp.downloader.external import Aria2cFD, _BY_NAME
+
+    class LiveAria2cFD(Aria2cFD):
+        """
+        定制的高性能并发分片下载器：
+        实时捕获 aria2c 标准输出，将分片进度、瞬时带宽和剩余时间无缝转化为 Python progress_hooks 实时回调。
+        """
+
+        _active_proc: Optional[subprocess.Popen] = None
+
+        def _call_process(self, cmd, info_dict):
+            # 强制加上每秒输出一次摘要，确保高频平滑汇报
+            fixed_cmd = []
+            for arg in cmd:
+                if arg.startswith("--summary-interval="):
+                    fixed_cmd.append("--summary-interval=1")
+                else:
+                    fixed_cmd.append(arg)
+            if not any(arg.startswith("--summary-interval=") for arg in fixed_cmd):
+                fixed_cmd.append("--summary-interval=1")
+
+            proc = subprocess.Popen(
+                fixed_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            LiveAria2cFD._active_proc = proc
+
+            last_reported_dl = None
+            try:
+                for line in proc.stdout:
+                    m = ARIA2_PROG_REGEX.search(line)
+                    if m:
+                        dl_str, tot_str, pct_str, cn_str, speed_str, eta_str = m.groups()
+                        dl_bytes = parse_readable_bytes(dl_str)
+                        if dl_bytes == last_reported_dl and dl_bytes > 0:
+                            continue
+                        last_reported_dl = dl_bytes
+
+                        tot_bytes = parse_readable_bytes(tot_str)
+                        speed_bytes = parse_readable_bytes(speed_str)
+                        eta_sec = parse_readable_eta(eta_str or "")
+
+                        m_rem, s_rem = divmod(eta_sec, 60)
+                        h_rem, m_rem = divmod(m_rem, 60)
+                        fmt_eta = f"{h_rem:02d}:{m_rem:02d}:{s_rem:02d}" if h_rem else (f"{m_rem:02d}:{s_rem:02d}" if (m_rem or s_rem) else "--:--")
+
+                        status_dict = {
+                            "status": "downloading",
+                            "downloaded_bytes": dl_bytes,
+                            "total_bytes": tot_bytes,
+                            "speed": speed_bytes,
+                            "eta": eta_sec,
+                            "filename": info_dict.get("_filename") or info_dict.get("filepath") or info_dict.get("filename") or "",
+                            "_speed_str": f"{speed_bytes / 1_048_576.0:.2f} MB/s",
+                            "_eta_str": fmt_eta,
+                            "info_dict": info_dict,
+                        }
+                        self._hook_progress(status_dict, info_dict)
+            except Exception:
+                pass
+
+            stderr = proc.stderr.read() if proc.stderr else ""
+            proc.wait()
+            LiveAria2cFD._active_proc = None
+            return "", stderr, proc.returncode
+
+    _BY_NAME["aria2c"] = LiveAria2cFD
+except Exception:
+    pass
 
 
 # ──────────────────────────────────────────────────────────────
@@ -369,6 +517,7 @@ def clear_current_cookie() -> bool:
 
 def get_base_ydl_opts(cookie_file: str | Path | None = None, browser: str | None = None) -> dict:
     """返回所有 yt-dlp 任务通用的基础反爬与环境配置（支持自动 Cookie 探测与浏览器注入）。"""
+    js_type, js_path = find_js_runtime()
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -378,7 +527,7 @@ def get_base_ydl_opts(cookie_file: str | Path | None = None, browser: str | None
         "fragment_retries": 5,
         **({"ffmpeg_location": FFMPEG_LOCATION} if FFMPEG_LOCATION else {}),
         "prefer_ffmpeg": True,
-        **({"js_runtimes": {"node": {"path": NODE_LOCATION}}} if NODE_LOCATION else {}),
+        **({"js_runtimes": {js_type: {"path": js_path}}} if js_type and js_path else {}),
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "mweb", "tv_samsung", "web"],
@@ -1181,6 +1330,11 @@ class DownloadTask:
     def cancel(self):
         """请求取消下载，并异步彻底清理未完成的临时文件。"""
         self._cancelled.set()
+        if LiveAria2cFD._active_proc:
+            try:
+                LiveAria2cFD._active_proc.terminate()
+            except Exception:
+                pass
         if self._transcode_proc:
             try:
                 self._transcode_proc.terminate()
@@ -1191,14 +1345,19 @@ class DownloadTask:
     def _cleanup_temp_files(self):
         """取消下载时彻底清理未完成的临时文件（.part、.ytdl、.aria2 及未混流的分轨文件）。
         同时清理字幕/封面等附属文件，并删除任务产生的空子目录。"""
-        # 立即终止可能正在运行的转码子进程
+        # 立即终止可能正在运行的 aria2c 与转码子进程
+        if LiveAria2cFD._active_proc:
+            try:
+                LiveAria2cFD._active_proc.kill()
+            except Exception:
+                pass
         if self._transcode_proc:
             try:
                 self._transcode_proc.kill()
             except Exception:
                 pass
 
-        # 延迟 0.3 秒，确保 yt-dlp 与 ffmpeg 进程完全释放文件句柄
+        # 延迟 0.3 秒，确保 yt-dlp 与 aria2c/ffmpeg 进程完全释放文件句柄
         time.sleep(0.3)
 
         # 1. 优先清理显式记录的临时文件（主文件 + .part/.aria2/.ytdl 旁路）
@@ -1567,7 +1726,7 @@ class DownloadTask:
             self._completed = True
             if final_path:
                 self.final_output_path = final_path
-            self.on_progress({"percent": 100, "speed_mb": 0, "eta_str": "00:00", "status": "done"})
+            self.on_progress({"percent": 100.0, "speed_str": "0.00 MB/s", "speed_mb": 0.0, "eta_str": "00:00", "status": "done"})
             self.on_status("下载完成：视频已成功保存", "success")
             try:
                 self.on_complete(self.final_output_path)
@@ -1653,6 +1812,26 @@ class DownloadTask:
             "fragment_retries": 10,
             "writethumbnail": True,
         }
+
+        # 智能挂载 JS 运行时（解密 YouTube n-challenge 彻底突破限速）
+        js_type, js_path = find_js_runtime()
+        if js_type and js_path:
+            ydl_opts["js_runtimes"] = {js_type: {"path": js_path}}
+
+        # 智能挂载 16 线程极速并发下载引擎 (LiveAria2cFD)
+        if ARIA2C_LOCATION and os.path.isfile(ARIA2C_LOCATION):
+            ydl_opts["external_downloader"] = {"default": ARIA2C_LOCATION}
+            ydl_opts["external_downloader_args"] = {
+                "aria2c": [
+                    "-x", "16",
+                    "-s", "16",
+                    "-k", "1M",
+                    "--min-split-size=1M",
+                    "--max-connection-per-server=16",
+                    "--summary-interval=1",
+                    "--file-allocation=none",
+                ]
+            }
 
         # 智能字幕配置
         if is_sub_enabled:
@@ -1943,25 +2122,21 @@ class DownloadTask:
             # 动态检测网络带宽
             speed_mb_s, speed_mbps = detect_network_speed(stream_url, timeout=3.0)
 
-            # 锁定原生 16 线程并发分片 + 10MB HTTP 分块引擎（既能跑满宽带，又能每秒触发多次精准 Python 进度回调）
-            ydl.params.update({
-                "concurrent_fragment_downloads": 16,
-                "http_chunk_size": 10485760,  # 10MB 分块请求突破限速
-                "buffersize": 65536,
-                "nopart": False,
-                "retries": 10,
-                "fragment_retries": 10,
-            })
-
             # 检测当前任务是否为音视频分流（多流）依次下载
             requested = info.get("requested_formats") or []
             self._is_multi_stream = len(requested) > 1
             self._video_stream_finished = False
 
-            self.on_status(
-                f"已识别网络环境 (~{int(speed_mbps)} Mbps)，已开启原生 16 线程极速并发下载",
-                "info",
-            )
+            if ARIA2C_LOCATION and os.path.isfile(ARIA2C_LOCATION):
+                self.on_status(
+                    "已智能监测网络状态，已开启 16 线程极速并发引擎加速拉满宽带...",
+                    "info",
+                )
+            else:
+                self.on_status(
+                    "已智能监测网络状态，已开启原生多线程分块加速下载...",
+                    "info",
+                )
 
             if self._cancelled.is_set():
                 self.on_status("已取消下载，已自动清理临时文件", "warning")
