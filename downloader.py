@@ -9,10 +9,22 @@ import sys
 import shutil
 import threading
 import time
+import re
+import json
+import subprocess
 import urllib.request
 from typing import Callable, Optional
 from pathlib import Path
 import yt_dlp
+
+ANSI_REGEX = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def clean_ansi(s: str | None) -> str:
+    """清理字符串中的 ANSI 转义颜色控制码。"""
+    if not s:
+        return ""
+    return ANSI_REGEX.sub("", str(s)).strip()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1153,6 +1165,9 @@ class DownloadTask:
         self._task_created_sidecar_files: set[str] = set()
         self.has_valid_cookie: bool = has_valid_cookie()
         self._is_hardware_transcoding: bool = False
+        self._transcode_proc: Optional[subprocess.Popen] = None
+        self._video_stream_finished: bool = False
+        self._is_multi_stream: bool = False
 
     # ── 公开接口 ──────────────────────────────────────────────
 
@@ -1166,12 +1181,24 @@ class DownloadTask:
     def cancel(self):
         """请求取消下载，并异步彻底清理未完成的临时文件。"""
         self._cancelled.set()
+        if self._transcode_proc:
+            try:
+                self._transcode_proc.terminate()
+            except Exception:
+                pass
         threading.Thread(target=self._cleanup_temp_files, daemon=True).start()
 
     def _cleanup_temp_files(self):
         """取消下载时彻底清理未完成的临时文件（.part、.ytdl、.aria2 及未混流的分轨文件）。
         同时清理字幕/封面等附属文件，并删除任务产生的空子目录。"""
-        # 延迟 0.3 秒，确保 yt-dlp 与 aria2c/ffmpeg 进程完全释放文件句柄
+        # 立即终止可能正在运行的转码子进程
+        if self._transcode_proc:
+            try:
+                self._transcode_proc.kill()
+            except Exception:
+                pass
+
+        # 延迟 0.3 秒，确保 yt-dlp 与 ffmpeg 进程完全释放文件句柄
         time.sleep(0.3)
 
         # 1. 优先清理显式记录的临时文件（主文件 + .part/.aria2/.ytdl 旁路）
@@ -1263,7 +1290,7 @@ class DownloadTask:
                 ffprobe_bin,
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,codec_tag_string",
+                "-show_entries", "stream=codec_name,codec_tag_string:format=duration",
                 "-of", "json",
                 file_path,
             ]
@@ -1275,6 +1302,12 @@ class DownloadTask:
             streams = data.get("streams", [])
             if not streams:
                 return
+
+            duration_str = data.get("format", {}).get("duration") or "0"
+            try:
+                duration = float(duration_str)
+            except (ValueError, TypeError):
+                duration = 0.0
 
             v_info = streams[0]
             c_name = str(v_info.get("codec_name") or "").lower()
@@ -1291,11 +1324,11 @@ class DownloadTask:
             if needs_transcode:
                 self.on_status("正在使用 Mac 硬件加速转换兼容格式...", "info")
                 self.on_progress({
-                    "percent": 100.0,
-                    "speed_str": "0.00 MB/s",
+                    "percent": 0.0,
+                    "speed_str": "转码中",
                     "speed_mb": 0.0,
-                    "eta_str": "转码中",
-                    "status": "merging",
+                    "eta_str": "计算中",
+                    "status": "transcoding",
                 })
 
                 target_h = getattr(self, "quality", {}).get("height") if isinstance(self.quality, dict) else None
@@ -1313,10 +1346,67 @@ class DownloadTask:
                     "-b:v", target_bitrate_str,
                     "-c:a", "copy",
                     "-movflags", "+faststart",
+                    "-progress", "pipe:1",
+                    "-nostats",
                     temp_trans,
                 ])
-                trans_res = subprocess.run(trans_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if trans_res.returncode == 0 and os.path.exists(temp_trans) and os.path.getsize(temp_trans) > 0:
+
+                proc = subprocess.Popen(
+                    trans_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                self._transcode_proc = proc
+
+                cur_speed_val = 0.0
+                cur_speed_str = "--"
+                for line in proc.stdout:
+                    if self._cancelled.is_set():
+                        proc.terminate()
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("speed="):
+                        cur_speed_str = line.split("=", 1)[1].strip()
+                        try:
+                            cur_speed_val = float(cur_speed_str.rstrip("xX").strip())
+                        except ValueError:
+                            cur_speed_val = 0.0
+                    elif line.startswith("out_time_us="):
+                        try:
+                            val_us = int(line.split("=", 1)[1].strip())
+                            cur_sec = val_us / 1_000_000.0
+                            if duration > 0:
+                                tc_pct = min(max((cur_sec / duration) * 100.0, 0.0), 99.9)
+                                if cur_speed_val > 0.05:
+                                    rem_sec = max(0, int((duration - cur_sec) / cur_speed_val))
+                                    m, s = divmod(rem_sec, 60)
+                                    h, m = divmod(m, 60)
+                                    tc_eta = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+                                else:
+                                    tc_eta = "--:--"
+                                speed_display = f"转码倍速 {cur_speed_str}" if cur_speed_str != "--" else "转码中"
+                                self.on_progress({
+                                    "percent": tc_pct,
+                                    "speed_str": speed_display,
+                                    "speed_mb": 0.0,
+                                    "eta_str": tc_eta,
+                                    "status": "transcoding",
+                                })
+                                self.on_status(
+                                    f"正在使用 Mac 硬件加速转换兼容格式...  {tc_pct:.1f}%  |  {speed_display}  |  预计剩余 {tc_eta}",
+                                    "info",
+                                )
+                        except Exception:
+                            pass
+
+                proc.wait()
+                self._transcode_proc = None
+
+                if not self._cancelled.is_set() and proc.returncode == 0 and os.path.exists(temp_trans) and os.path.getsize(temp_trans) > 0:
                     os.replace(temp_trans, file_path)
                     self.on_status("兼容格式硬件加速转换完成", "success")
         except Exception:
@@ -1555,9 +1645,10 @@ class DownloadTask:
             "outtmpl": outtmpl,
             "progress_hooks": [self._progress_hook],
             "postprocessor_hooks": [self._postprocessor_hook],
-            "concurrent_fragment_downloads": 6,
-            "http_chunk_size": 10 * 1024 * 1024,  # 10MB 字节范围分块，突破 YouTube 单连接限速
-            "buffersize": 1024 * 1024,
+            "concurrent_fragment_downloads": 16,
+            "http_chunk_size": 10485760,  # 10MB 字节范围分块，突破 YouTube 单连接限速
+            "buffersize": 65536,
+            "nopart": False,
             "retries": 10,
             "fragment_retries": 10,
             "writethumbnail": True,
@@ -1849,56 +1940,28 @@ class DownloadTask:
                         stream_url = f.get("url")
                         break
 
-            # 动态检测网络带宽并自适应分配最佳并发与缓存
+            # 动态检测网络带宽
             speed_mb_s, speed_mbps = detect_network_speed(stream_url, timeout=3.0)
-            concurrent, buf_size = get_adaptive_download_config(speed_mb_s)
 
-            # ── 多连接并发加速引擎：自动选择最快下载策略 ──
-            # 策略一：aria2c 外部多线程（最优先，与 IDM 同理的 16 分段并发，实测最快）
-            # 策略二：yt-dlp 原生 16 线程分片 + 10MB HTTP 分块（无 aria2c 时的高速备选）
-            use_aria2c = False
-            aria2c_bin = ARIA2C_LOCATION
-            if not aria2c_bin:
-                # 额外探测系统已安装的 aria2c（如 Homebrew）
-                for extra_path in ["/opt/homebrew/bin/aria2c", "/usr/local/bin/aria2c", "/usr/bin/aria2c"]:
-                    if os.path.isfile(extra_path) and os.access(extra_path, os.X_OK):
-                        aria2c_bin = extra_path
-                        break
+            # 锁定原生 16 线程并发分片 + 10MB HTTP 分块引擎（既能跑满宽带，又能每秒触发多次精准 Python 进度回调）
+            ydl.params.update({
+                "concurrent_fragment_downloads": 16,
+                "http_chunk_size": 10485760,  # 10MB 分块请求突破限速
+                "buffersize": 65536,
+                "nopart": False,
+                "retries": 10,
+                "fragment_retries": 10,
+            })
 
-            # aria2c 仅在非 HDR / 非 MKV 原画拷贝场景下启用（HDR 拷贝走 yt-dlp 内置分片更稳定）
-            out_fmt_check = getattr(self, "output_format", "MP4 (苹果兼容)")
-            is_copy_only = "MKV" in out_fmt_check or "WebM" in out_fmt_check
+            # 检测当前任务是否为音视频分流（多流）依次下载
+            requested = info.get("requested_formats") or []
+            self._is_multi_stream = len(requested) > 1
+            self._video_stream_finished = False
 
-            if aria2c_bin and not is_copy_only:
-                use_aria2c = True
-                ydl.params.update({
-                    "external_downloader": aria2c_bin,
-                    "external_downloader_args": {
-                        "default": ["-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none",
-                                    "--console-log-level=warn", "--summary-interval=0"],
-                    },
-                    "concurrent_fragment_downloads": 16,
-                    "buffersize": buf_size,
-                    "retries": 10,
-                    "fragment_retries": 10,
-                })
-                self.on_status(
-                    f"已识别网络环境 (~{int(speed_mbps)} Mbps)，自动启用 aria2c 16 线程极速并发下载",
-                    "info",
-                )
-            else:
-                # 原生多线程分片 + HTTP 分块分段（零外部依赖高速模式）
-                ydl.params.update({
-                    "concurrent_fragment_downloads": concurrent,
-                    "http_chunk_size": 10 * 1024 * 1024,  # 10MB 字节范围分块，突破 YouTube 单连接限速
-                    "buffersize": buf_size,
-                    "retries": 10,
-                    "fragment_retries": 10,
-                })
-                self.on_status(
-                    f"已识别网络环境 (~{int(speed_mbps)} Mbps)，自动开启 {concurrent} 线程极速并发分片下载",
-                    "info",
-                )
+            self.on_status(
+                f"已识别网络环境 (~{int(speed_mbps)} Mbps)，已开启原生 16 线程极速并发下载",
+                "info",
+            )
 
             if self._cancelled.is_set():
                 self.on_status("已取消下载，已自动清理临时文件", "warning")
@@ -2022,13 +2085,30 @@ class DownloadTask:
             self._cleanup_temp_files()
             raise yt_dlp.utils.DownloadCancelled()
 
+        fn = str(d.get("filename") or d.get("tmpfilename") or "")
+        info_dict = d.get("info_dict") or {}
+        ext = str(info_dict.get("ext") or "").lower()
+
+        # 1. 过滤字幕与图片等非音视频附属文件：严禁修改主进度条或触发 finished！
+        NON_MEDIA_EXTS = (
+            ".srt", ".vtt", ".ass", ".lrc", ".ttml", ".srv3",
+            ".jpg", ".jpeg", ".png", ".webp",
+        )
+        is_non_media = (
+            any(fn.lower().endswith(e) for e in NON_MEDIA_EXTS)
+            or any(ext == e.lstrip(".") for e in NON_MEDIA_EXTS)
+        )
+
         # 动态收集正在写入的文件路径以便取消时能够精准清理
-        fn = d.get("filename")
         if fn:
-            self.active_temp_files.add(fn)
-            self.active_temp_files.add(f"{fn}.part")
-            self.active_temp_files.add(f"{fn}.aria2")
-            self.active_temp_files.add(f"{fn}.ytdl")
+            if is_non_media:
+                self._task_created_sidecar_files.add(fn)
+            else:
+                self.active_temp_files.add(fn)
+                self.active_temp_files.add(f"{fn}.part")
+                self.active_temp_files.add(f"{fn}.aria2")
+                self.active_temp_files.add(f"{fn}.ytdl")
+
             # 自动记录字幕子目录：当 outtmpl 包含子目录时，取 filename 的父目录
             if self._task_subfolder is None:
                 try:
@@ -2042,11 +2122,18 @@ class DownloadTask:
                 except Exception:
                     pass
 
-        tmpfn = d.get("tmpfilename")
+        tmpfn = str(d.get("tmpfilename") or "")
         if tmpfn:
-            self.active_temp_files.add(tmpfn)
-            self.active_temp_files.add(f"{tmpfn}.aria2")
-            self.active_temp_files.add(f"{tmpfn}.part")
+            if is_non_media:
+                self._task_created_sidecar_files.add(tmpfn)
+            else:
+                self.active_temp_files.add(tmpfn)
+                self.active_temp_files.add(f"{tmpfn}.aria2")
+                self.active_temp_files.add(f"{tmpfn}.part")
+
+        # 若是非音视频文件（字幕、封面等），直接 return，绝不允许影响进度！
+        if is_non_media:
+            return
 
         status = d.get("status")
 
@@ -2063,77 +2150,101 @@ class DownloadTask:
             # 优先按字节：若 total_bytes 或 total_bytes_estimate 存在，则用 (downloaded / total) * 100
             if total and total > 0:
                 self._total_bytes = total
-                percent = (downloaded / total) * 100.0
+                stream_pct = (downloaded / total) * 100.0
             else:
                 # DASH 分片兜底：若无 total_bytes，但存在 fragment_index 和 fragment_count
                 frag_index = d.get("fragment_index")
                 frag_count = d.get("fragment_count")
                 if frag_index is not None and frag_count and frag_count > 0:
-                    percent = (frag_index / frag_count) * 100.0
+                    stream_pct = (frag_index / frag_count) * 100.0
                 else:
-                    percent = getattr(self, "_last_percent", 0.0)
+                    stream_pct = getattr(self, "_last_percent", 0.0)
+
+            # 区分音视频多流：视频占 0%~90%，音频占 90%~99.9%
+            vcodec = str(info_dict.get("vcodec") or "").lower()
+            acodec = str(info_dict.get("acodec") or "").lower()
+            is_audio_stream = (vcodec == "none" and acodec != "none")
+
+            if getattr(self, "_is_multi_stream", False):
+                if getattr(self, "_video_stream_finished", False) or is_audio_stream:
+                    percent = 90.0 + (stream_pct * 0.099)
+                else:
+                    percent = stream_pct * 0.90
+            else:
+                percent = stream_pct
 
             # 确保平滑单调递增，不抖动回退；未进入合并转码前最多显示 99.9%
             percent = min(max(getattr(self, "_last_percent", 0.0), percent), 99.9)
             self._last_percent = percent
 
             # 2. 实时下载速度计算：
-            # 若 d.get('speed') 存在且 > 0 则直接采用；
-            # 若 d.get('speed') 为 None（分片下载常见情况），则使用本地平滑计时器：记录已下载字节数增量与时间差
+            # 若 d.get('speed') 存在且 > 0 则直接采用；若为 None 则尝试读取清理 ANSI 的 _speed_str，最后才回退本地计时器
             speed = d.get("speed")
+            speed_str = ""
+            speed_mb = 0.0
             if speed is not None and speed > 0:
                 speed_mb = speed / 1_048_576.0
+                speed_str = f"{speed_mb:.2f} MB/s"
                 self._speed_ema_mb = speed_mb
                 self._last_calc_time = now
                 self._last_calc_bytes = downloaded
             else:
-                if self._last_calc_time == 0.0:
-                    self._last_calc_time = now
-                    self._last_calc_bytes = downloaded
-                    speed_mb = self._speed_ema_mb
+                raw_speed_str = clean_ansi(d.get("_speed_str"))
+                if raw_speed_str:
+                    speed_str = raw_speed_str
                 else:
-                    dt = now - self._last_calc_time
-                    if dt >= 0.25:  # 每 0.25 秒以上采样一次增量，平滑计算即时速率
-                        delta_bytes = max(0, downloaded - self._last_calc_bytes)
-                        instant_speed_mb = (delta_bytes / dt) / 1_048_576.0
-                        if self._speed_ema_mb == 0.0:
-                            self._speed_ema_mb = instant_speed_mb
-                        else:
-                            self._speed_ema_mb = 0.65 * self._speed_ema_mb + 0.35 * instant_speed_mb
+                    if self._last_calc_time == 0.0:
                         self._last_calc_time = now
                         self._last_calc_bytes = downloaded
-                    speed_mb = self._speed_ema_mb
+                        speed_mb = self._speed_ema_mb
+                    else:
+                        dt = now - self._last_calc_time
+                        if dt >= 0.25:  # 每 0.25 秒以上采样一次增量，平滑计算即时速率
+                            delta_bytes = max(0, downloaded - self._last_calc_bytes)
+                            instant_speed_mb = (delta_bytes / dt) / 1_048_576.0
+                            if self._speed_ema_mb == 0.0:
+                                self._speed_ema_mb = instant_speed_mb
+                            else:
+                                self._speed_ema_mb = 0.65 * self._speed_ema_mb + 0.35 * instant_speed_mb
+                            self._last_calc_time = now
+                            self._last_calc_bytes = downloaded
+                        speed_mb = self._speed_ema_mb
+                    speed_str = f"{speed_mb:.2f} MB/s"
 
             self._last_speed_mb = speed_mb
 
-            # 3. 剩余时间 (ETA)：优先使用 d.get('eta')；若无则通过剩余量与速率动态换算
+            # 3. 剩余时间 (ETA)：优先使用 d.get('eta')；若为 None 读取 _eta_str，最后才通过剩余量动态换算
             eta = d.get("eta")
+            eta_str = ""
             if eta is not None and eta >= 0:
                 m, s = divmod(int(eta), 60)
                 h, m = divmod(m, 60)
                 eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
             else:
-                tot = self._total_bytes
-                if tot and tot > downloaded and speed_mb > 0.05:
-                    rem_mb = (tot - downloaded) / 1_048_576.0
-                    rem_sec = int(rem_mb / speed_mb)
-                    m, s = divmod(rem_sec, 60)
-                    h, m = divmod(m, 60)
-                    eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-                elif percent > 1.0 and (now - self._start_download_time) > 1.0:
-                    elapsed = now - self._start_download_time
-                    pct_per_sec = percent / elapsed
-                    if pct_per_sec > 0:
-                        rem_sec = int((100.0 - percent) / pct_per_sec)
+                raw_eta_str = clean_ansi(d.get("_eta_str"))
+                if raw_eta_str and raw_eta_str != "--:--":
+                    eta_str = raw_eta_str
+                else:
+                    tot = self._total_bytes
+                    if tot and tot > downloaded and speed_mb > 0.05:
+                        rem_mb = (tot - downloaded) / 1_048_576.0
+                        rem_sec = int(rem_mb / speed_mb)
                         m, s = divmod(rem_sec, 60)
                         h, m = divmod(m, 60)
                         eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+                    elif percent > 1.0 and (now - self._start_download_time) > 1.0:
+                        elapsed = now - self._start_download_time
+                        pct_per_sec = percent / elapsed
+                        if pct_per_sec > 0:
+                            rem_sec = int((100.0 - percent) / pct_per_sec)
+                            m, s = divmod(rem_sec, 60)
+                            h, m = divmod(m, 60)
+                            eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+                        else:
+                            eta_str = "--:--"
                     else:
                         eta_str = "--:--"
-                else:
-                    eta_str = "--:--"
 
-            speed_str = f"{speed_mb:.2f} MB/s"
             # 传递标准结构字典至 UI 回调
             self.on_progress({
                 "percent": percent,
@@ -2143,29 +2254,18 @@ class DownloadTask:
                 "status": "downloading",
             })
             self.on_status(
-                f"下载中  {percent:.1f}%  |  {speed_str}  |  剩余 {eta_str}",
+                f"正在高速下载视频...  {percent:.1f}%  |  {speed_str}  |  预计剩余 {eta_str}",
                 "info",
             )
 
         elif status == "finished":
-            if getattr(self, "_is_hardware_transcoding", False):
-                self.on_progress({
-                    "percent": 100.0,
-                    "speed_str": "0.00 MB/s",
-                    "speed_mb": 0.0,
-                    "eta_str": "转码中",
-                    "status": "merging",
-                })
-                self.on_status("正在使用 Mac 硬件加速转换兼容格式...", "info")
+            # 严禁在单个流 finished 时锁死进度条或提前显示转码！
+            # 若有多流且视频流刚下载完，标记并提示开始下载音频流
+            if getattr(self, "_is_multi_stream", False) and not getattr(self, "_video_stream_finished", False):
+                self._video_stream_finished = True
+                self.on_status("视频轨下载完成，正在下载音频轨...", "info")
             else:
-                self.on_progress({
-                    "percent": 100.0,
-                    "speed_str": "0.00 MB/s",
-                    "speed_mb": 0.0,
-                    "eta_str": "00:00",
-                    "status": "merging",
-                })
-                self.on_status("正在合并音视频，请稍候…", "info")
+                self.on_status("音视频流下载完成，准备合成...", "info")
 
         elif status == "error":
             self.on_status("下载出错", "error")
@@ -2179,14 +2279,21 @@ class DownloadTask:
                 if getattr(self, "_is_hardware_transcoding", False):
                     self.on_status("正在使用 Mac 硬件加速转换兼容格式...", "info")
                     self.on_progress({
-                        "percent": 100.0,
-                        "speed_str": "0.00 MB/s",
+                        "percent": 99.9,
+                        "speed_str": "转码中",
                         "speed_mb": 0.0,
                         "eta_str": "转码中",
                         "status": "merging",
                     })
                 else:
-                    self.on_status("正在合并音视频轨，请稍候…", "info")
+                    self.on_status("正在合并音视频，请稍候…", "info")
+                    self.on_progress({
+                        "percent": 99.9,
+                        "speed_str": "0.00 MB/s",
+                        "speed_mb": 0.0,
+                        "eta_str": "合并中",
+                        "status": "merging",
+                    })
         elif status == "finished":
             fp = d.get("filepath") or d.get("info_dict", {}).get("filepath") or d.get("info_dict", {}).get("_filename")
             if fp and os.path.exists(fp):

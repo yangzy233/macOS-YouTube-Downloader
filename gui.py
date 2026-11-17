@@ -2626,25 +2626,27 @@ class App(ctk.CTk):
         if not speed_str:
             speed_mb = float(data.get("speed_mb", 0.0))
             speed_str = f"{speed_mb:.2f} MB/s"
-        eta_str = str(data.get("eta_str", "--:--"))
+        eta_raw = str(data.get("eta_str", "--:--")).strip()
+        eta_str = eta_raw if ("剩余" in eta_raw or eta_raw in ("转码中", "合并中", "计算中", "--:--")) else f"预计剩余 {eta_raw}"
 
         bar_val = min(max(percent / 100.0, 0.0), 1.0)
         self._progress_bar.set(bar_val)
         self._pct_label.configure(text=f"{percent:.1f}%")
         self._speed_label.configure(text=speed_str)
-        self._eta_label.configure(text=f"预计剩余 {eta_str}")
+        self._eta_label.configure(text=eta_str)
 
     def _apply_queue_progress_ui(self, idx: int, total: int, data: dict):
         percent = float(data.get("percent", 0.0))
         overall_pct = ((idx + percent / 100.0) / total) * 100.0
         speed_str = data.get("speed_str") or f"{float(data.get('speed_mb', 0.0)):.2f} MB/s"
-        eta_str = str(data.get("eta_str", "--:--"))
+        eta_raw = str(data.get("eta_str", "--:--")).strip()
+        eta_str = eta_raw if ("剩余" in eta_raw or eta_raw in ("转码中", "合并中", "计算中", "--:--")) else f"预计剩余 {eta_raw}"
 
         bar_val = min(max(overall_pct / 100.0, 0.0), 1.0)
         self._progress_bar.set(bar_val)
         self._pct_label.configure(text=f"{overall_pct:.1f}% ({idx + 1}/{total})")
         self._speed_label.configure(text=speed_str)
-        self._eta_label.configure(text=f"预计剩余 {eta_str}")
+        self._eta_label.configure(text=eta_str)
 
     def _update_queue_item_status(self, idx: int, text: str, bg_color, text_color: str = "#FFFFFF", final_filepath: str | None = None):
         if 0 <= idx < len(self._queue_row_widgets):
