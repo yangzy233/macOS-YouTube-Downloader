@@ -1080,19 +1080,19 @@ def detect_network_speed(test_url: str | None, timeout: float = 3.0) -> tuple[fl
 def get_adaptive_download_config(speed_mb_s: float) -> tuple[int, int]:
     """
     根据实测速率动态决定 ydl_opts 中的并发与缓冲区参数：
-    - < 5 MB/s (约 50M 以下)：concurrent_fragment_downloads = 2, buffersize = 256KB
-    - 5 ~ 15 MB/s (约 100M 宽带)：concurrent_fragment_downloads = 3, buffersize = 512KB
-    - 15 ~ 35 MB/s (约 200M~300M 宽带)：concurrent_fragment_downloads = 6, buffersize = 1MB
-    - > 35 MB/s (500M~千兆宽带)：concurrent_fragment_downloads = 8, buffersize = 2MB
+    - < 5 MB/s (约 50M 以下)：concurrent_fragment_downloads = 4, buffersize = 512KB
+    - 5 ~ 15 MB/s (约 100M 宽带)：concurrent_fragment_downloads = 8, buffersize = 1MB
+    - 15 ~ 35 MB/s (约 200M~300M 宽带)：concurrent_fragment_downloads = 12, buffersize = 2MB
+    - > 35 MB/s (500M~千兆宽带)：concurrent_fragment_downloads = 16, buffersize = 4MB
     """
     if speed_mb_s < 5.0:
-        return 2, 256 * 1024
+        return 4, 512 * 1024
     elif speed_mb_s < 15.0:
-        return 3, 512 * 1024
+        return 8, 1024 * 1024
     elif speed_mb_s <= 35.0:
-        return 6, 1024 * 1024
+        return 12, 2 * 1024 * 1024
     else:
-        return 8, 2 * 1024 * 1024
+        return 16, 4 * 1024 * 1024
 
 
 class DownloadTask:
@@ -1147,6 +1147,10 @@ class DownloadTask:
         self._start_download_time: float = 0.0
         self._total_bytes: int | None = None
         self.active_temp_files: set[str] = set()
+        # 追踪该任务产生的字幕子目录（开启字幕时为 save_dir/视频标题/）
+        self._task_subfolder: str | None = None
+        # 追踪该任务实际产生的字幕及封面等附属文件（取消时一并清理）
+        self._task_created_sidecar_files: set[str] = set()
         self.has_valid_cookie: bool = has_valid_cookie()
         self._is_hardware_transcoding: bool = False
 
@@ -1165,11 +1169,12 @@ class DownloadTask:
         threading.Thread(target=self._cleanup_temp_files, daemon=True).start()
 
     def _cleanup_temp_files(self):
-        """取消下载时彻底清理未完成的临时文件（.part、.ytdl、.aria2 及未混流的分轨文件）。"""
-        # 稍微延迟 0.2 秒，确保 yt-dlp 与 aria2c/ffmpeg 进程完全释放文件句柄
-        time.sleep(0.2)
+        """取消下载时彻底清理未完成的临时文件（.part、.ytdl、.aria2 及未混流的分轨文件）。
+        同时清理字幕/封面等附属文件，并删除任务产生的空子目录。"""
+        # 延迟 0.3 秒，确保 yt-dlp 与 aria2c/ffmpeg 进程完全释放文件句柄
+        time.sleep(0.3)
 
-        # 1. 优先清理显式记录的临时文件
+        # 1. 优先清理显式记录的临时文件（主文件 + .part/.aria2/.ytdl 旁路）
         for file_path in list(self.active_temp_files):
             try:
                 p = Path(file_path)
@@ -1182,18 +1187,54 @@ class DownloadTask:
             except Exception:
                 pass
 
-        # 2. 目录兜底扫描：根据当前任务的 save_dir 扫描未完成的临时文件
+        # 2. 清理字幕/封面等附属文件（progress_hook / postprocessor_hook 中追踪的）
+        for file_path in list(self._task_created_sidecar_files):
+            try:
+                p = Path(file_path)
+                if p.exists() and p.is_file():
+                    os.remove(p)
+            except Exception:
+                pass
+
+        # 3. 目录兜底扫描：在 save_dir 及字幕子目录中扫描所有残留碎片
+        def _scan_and_clean(dir_path: Path):
+            if not dir_path.exists() or not dir_path.is_dir():
+                return
+            patterns = [
+                "*.part", "*.ytdl", "*.aria2", "*.temp",
+                "*.f*.mp4", "*.f*.webm", "*.f*.m4a",
+                "*.srt", "*.vtt", "*.ttml", "*.srv3",
+                "*.jpg", "*.webp", "*.png",
+                "*.part-Frag*",
+            ]
+            for pat in patterns:
+                for temp_file in dir_path.glob(pat):
+                    try:
+                        if temp_file.is_file():
+                            os.remove(temp_file)
+                    except Exception:
+                        pass
+
         try:
             save_path = Path(self.save_dir)
-            if save_path.exists() and save_path.is_dir():
-                patterns = ["*.part", "*.ytdl", "*.aria2", "*.f*.mp4", "*.f*.webm", "*.f*.m4a"]
-                for pat in patterns:
-                    for temp_file in save_path.glob(pat):
-                        try:
-                            if temp_file.is_file():
-                                os.remove(temp_file)
-                        except Exception:
-                            pass
+            _scan_and_clean(save_path)
+            # 若任务开启了字幕且创建了独立子目录，也对其进行清理
+            if self._task_subfolder:
+                sub_path = Path(self._task_subfolder)
+                _scan_and_clean(sub_path)
+                # 安全删除空文件夹（严格限制：路径不等于 save_dir 根目录）
+                try:
+                    if (
+                        sub_path.exists()
+                        and sub_path.is_dir()
+                        and sub_path != save_path
+                        and str(sub_path.resolve()) != str(save_path.resolve())
+                    ):
+                        entries = list(sub_path.iterdir())
+                        if not entries:
+                            os.rmdir(sub_path)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1503,6 +1544,9 @@ class DownloadTask:
         # 视频与字幕同名独立子目录归档逻辑：当开启字幕时存入同名子目录，未开启时平铺保存
         if is_sub_enabled:
             outtmpl = str(Path(self.save_dir) / "%(title)s" / "%(title)s.%(ext)s")
+            # 记录字幕子目录路径（取消时可定向清理空文件夹）
+            # 实际子目录名取决于视频标题，这里先记录 save_dir 下的通配前缀，后续在 progress_hook 中精确记录
+            self._task_subfolder = None  # 将在 _progress_hook 中首次获取到 filename 时精确设置
         else:
             outtmpl = str(Path(self.save_dir) / "%(title)s.%(ext)s")
 
@@ -1512,6 +1556,7 @@ class DownloadTask:
             "progress_hooks": [self._progress_hook],
             "postprocessor_hooks": [self._postprocessor_hook],
             "concurrent_fragment_downloads": 6,
+            "http_chunk_size": 10 * 1024 * 1024,  # 10MB 字节范围分块，突破 YouTube 单连接限速
             "buffersize": 1024 * 1024,
             "retries": 10,
             "fragment_retries": 10,
@@ -1808,18 +1853,52 @@ class DownloadTask:
             speed_mb_s, speed_mbps = detect_network_speed(stream_url, timeout=3.0)
             concurrent, buf_size = get_adaptive_download_config(speed_mb_s)
 
-            # 动态更新 ydl 参数
-            ydl.params.update({
-                "concurrent_fragment_downloads": concurrent,
-                "buffersize": buf_size,
-                "retries": 10,
-                "fragment_retries": 10,
-            })
+            # ── 多连接并发加速引擎：自动选择最快下载策略 ──
+            # 策略一：aria2c 外部多线程（最优先，与 IDM 同理的 16 分段并发，实测最快）
+            # 策略二：yt-dlp 原生 16 线程分片 + 10MB HTTP 分块（无 aria2c 时的高速备选）
+            use_aria2c = False
+            aria2c_bin = ARIA2C_LOCATION
+            if not aria2c_bin:
+                # 额外探测系统已安装的 aria2c（如 Homebrew）
+                for extra_path in ["/opt/homebrew/bin/aria2c", "/usr/local/bin/aria2c", "/usr/bin/aria2c"]:
+                    if os.path.isfile(extra_path) and os.access(extra_path, os.X_OK):
+                        aria2c_bin = extra_path
+                        break
 
-            self.on_status(
-                f"已识别网络环境 (~{int(speed_mbps)} Mbps)，自动开启 {concurrent} 线程极速并发分片下载",
-                "info",
-            )
+            # aria2c 仅在非 HDR / 非 MKV 原画拷贝场景下启用（HDR 拷贝走 yt-dlp 内置分片更稳定）
+            out_fmt_check = getattr(self, "output_format", "MP4 (苹果兼容)")
+            is_copy_only = "MKV" in out_fmt_check or "WebM" in out_fmt_check
+
+            if aria2c_bin and not is_copy_only:
+                use_aria2c = True
+                ydl.params.update({
+                    "external_downloader": aria2c_bin,
+                    "external_downloader_args": {
+                        "default": ["-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none",
+                                    "--console-log-level=warn", "--summary-interval=0"],
+                    },
+                    "concurrent_fragment_downloads": 16,
+                    "buffersize": buf_size,
+                    "retries": 10,
+                    "fragment_retries": 10,
+                })
+                self.on_status(
+                    f"已识别网络环境 (~{int(speed_mbps)} Mbps)，自动启用 aria2c 16 线程极速并发下载",
+                    "info",
+                )
+            else:
+                # 原生多线程分片 + HTTP 分块分段（零外部依赖高速模式）
+                ydl.params.update({
+                    "concurrent_fragment_downloads": concurrent,
+                    "http_chunk_size": 10 * 1024 * 1024,  # 10MB 字节范围分块，突破 YouTube 单连接限速
+                    "buffersize": buf_size,
+                    "retries": 10,
+                    "fragment_retries": 10,
+                })
+                self.on_status(
+                    f"已识别网络环境 (~{int(speed_mbps)} Mbps)，自动开启 {concurrent} 线程极速并发分片下载",
+                    "info",
+                )
 
             if self._cancelled.is_set():
                 self.on_status("已取消下载，已自动清理临时文件", "warning")
@@ -1950,6 +2029,18 @@ class DownloadTask:
             self.active_temp_files.add(f"{fn}.part")
             self.active_temp_files.add(f"{fn}.aria2")
             self.active_temp_files.add(f"{fn}.ytdl")
+            # 自动记录字幕子目录：当 outtmpl 包含子目录时，取 filename 的父目录
+            if self._task_subfolder is None:
+                try:
+                    p = Path(fn)
+                    parent = p.parent
+                    save_p = Path(self.save_dir).resolve()
+                    parent_resolved = parent.resolve()
+                    # 只在父目录是 save_dir 的直接子目录时才记录（避免误记为根目录）
+                    if parent_resolved != save_p and parent_resolved.parent == save_p:
+                        self._task_subfolder = str(parent_resolved)
+                except Exception:
+                    pass
 
         tmpfn = d.get("tmpfilename")
         if tmpfn:
@@ -2100,6 +2191,19 @@ class DownloadTask:
             fp = d.get("filepath") or d.get("info_dict", {}).get("filepath") or d.get("info_dict", {}).get("_filename")
             if fp and os.path.exists(fp):
                 self.final_output_path = os.path.abspath(fp)
+
+            # 追踪后处理阶段生成的附属文件（字幕 .srt/.vtt、封面 .jpg/.webp 等）
+            # 这些文件只在下载完成后才有价值，取消时需一并清理
+            info_dict = d.get("info_dict") or {}
+            # 从 info_dict 收集字幕文件路径
+            for lang, sub_info in (info_dict.get("requested_subtitles") or {}).items():
+                sub_fp = sub_info.get("filepath") if isinstance(sub_info, dict) else None
+                if sub_fp and os.path.isfile(sub_fp):
+                    self._task_created_sidecar_files.add(sub_fp)
+            # 追踪封面图片
+            thumb_fp = info_dict.get("thumbnail_filename") or info_dict.get("__thumbnail_filename")
+            if thumb_fp and os.path.isfile(thumb_fp):
+                self._task_created_sidecar_files.add(thumb_fp)
 
 
 # 兼容性别名
